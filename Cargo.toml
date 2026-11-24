@@ -1,0 +1,28 @@
+[package]
+name = "bmus"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.78"
+build = "build.rs"
+description = "cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus），只拉音频"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
+ratatui = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls", "json", "gzip", "brotli"] }
+md5 = "0.7"
+urlencoding = "2"
+dirs = "5"
+qrcode = { version = "0.14", default-features = false }
+toml = "0.8"
+unicode-width = "0.1"
+libloading = "0.8"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[[bin]]
+name = "bmus"
+path = "src/main.rs"
