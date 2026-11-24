@@ -1,6 +1,7 @@
 [package]
 name = "bmus"
 version = "0.4.0"
+license = "WTFPL"
 edition = "2021"
 rust-version = "1.78"
 build = "build.rs"

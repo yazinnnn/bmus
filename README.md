@@ -250,4 +250,10 @@ downloads(id, uid, bvid, page, title, path, pubdate, ts)  -- 去重依据 pubdat
 - 点赞只支持"赞"，无取消赞；收藏固定写入默认收藏夹。
 - 不支持弹幕、评论、投币、下载视频画面。
 - 只发布 Linux 与 Windows 预编译产物；macOS 需自行构建（缺 Apple SDK）。
+
+## 许可证
+
+本项目采用 [WTFPL v2](LICENSE)（Do What The Fuck You Want To Public License）：想怎么用就怎么用——复制、修改、发布、使用、编译、销售、分发，商业或非商业用途皆可，无需署名、无需开源。
+
+第三方 Rust 依赖均为宽松协议（MIT / Apache-2.0 / BSD / ISC / Zlib / Unicode-3.0 / MPL-2.0 等），无 GPL/AGPL；分发二进制时应一并附带其许可证声明。mpv / ffmpeg 仅作为外部程序或运行时动态库调用，未随本项目分发。
 #（注：内容由AI生成）
