@@ -27,6 +27,8 @@ pub struct Config {
     pub filename_template: String,
     pub ffmpeg_path: String,
     pub max_bitrate: u32,
+    /// 是否允许在 TUI 里给当前视频/直播发弹幕（:say）。默认关闭，涉及账号风控
+    pub allow_send: bool,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             filename_template: "[%(upload_date)s]%(title).150B [%(id)s].%(ext)s".into(),
             ffmpeg_path: "ffmpeg".into(),
             max_bitrate: 192,
+            allow_send: true,
         }
     }
 }
@@ -97,6 +100,56 @@ fn migrate_legacy_db() {
     let _ = fs::copy(&old, &new);
 }
 
+/// 只追加旧文件里没有的键，已有键（含用户改过的值）一律不动
+fn merge_missing(path: PathBuf, cfg: &Config) {
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    let full = match toml::Value::try_from(cfg) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let defaults = match full.as_table() {
+        Some(t) => t,
+        None => return,
+    };
+    let existing = raw
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|v| v.as_table().cloned())
+        .unwrap_or_default();
+    let mut appended = String::new();
+    for (k, v) in defaults {
+        if existing.contains_key(k) {
+            continue;
+        }
+        let lit = match v {
+            toml::Value::String(x) => format!("{:?}", x),
+            toml::Value::Boolean(b) => b.to_string(),
+            toml::Value::Integer(i) => i.to_string(),
+            toml::Value::Float(f) => f.to_string(),
+            _ => continue,
+        };
+        appended.push_str(&format!("{} = {}\n", k, lit));
+    }
+    if appended.is_empty() {
+        return;
+    }
+    let mut out = raw;
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&appended);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if fs::write(&path, out).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 impl Config {
     pub fn load() -> Self {
         migrate_legacy();
@@ -120,13 +173,8 @@ impl Config {
             cfg.download_dir = "~/Music/bili_rec".into();
             let _ = cfg.save();
         }
-        // 首次/新增配置项时把默认值落盘，方便用户直接编辑
-        let missing = fs::read_to_string(config_path())
-            .map(|s| !s.contains("filename_template"))
-            .unwrap_or(true);
-        if missing {
-            let _ = cfg.save();
-        }
+        // 版本升级新增字段：把默认值补进旧配置文件，注释与已有值保持原样
+        merge_missing(config_path(), &cfg);
         cfg
     }
 

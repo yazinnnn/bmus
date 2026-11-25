@@ -1,11 +1,12 @@
 //! cmus 风格 TUI：视图 + 队列 + 浏览导航（收藏夹 / UP 主 / 合集 / 播放列表）
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,10 +15,13 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::VecDeque;
 use std::io::Stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use crate::api::{fmt_time, Api, Source, Track};
+use crate::danmaku::{DmEvent, DmKind, DmLine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
@@ -46,6 +50,13 @@ impl Repeat {
     }
 }
 
+/// 发送目标：视频（cid + 当前进度秒）或直播间
+#[derive(Clone, Debug)]
+pub enum SayTarget {
+    Video { cid: i64, bvid: String, progress: u64 },
+    Live { room: i64 },
+}
+
 /// 后台任务：网络请求全部放到 worker 线程，避免卡住 UI
 pub enum Job {
     Cfg(crate::config::Config),
@@ -53,6 +64,14 @@ pub enum Job {
     More { kind: ViewKind, page: u32, kw: String, sid: i64, skind: u8, smid: i64 },
     Play { track: Track, low: bool, live_low: bool },
     Dynamic,
+    /// 直播进房（计入观看 + 直播历史）
+    LiveEntry { room: i64 },
+    /// 视频播放心跳（计入播放 + 历史）
+    Heartbeat { aid: i64, cid: i64, pos: u64 },
+    /// 发送弹幕（:say 确认后）
+    Say { text: String, target: SayTarget },
+    /// 直播间高能榜（只读）
+    Rank { room: i64 },
 }
 
 pub enum JobOut {
@@ -61,6 +80,9 @@ pub enum JobOut {
     More { page: u32, items: Vec<Track>, err: Option<String> },
     Play { track: Track, urls: Vec<String>, label: String, err: Option<String> },
     Dynamic { lives: Vec<Track>, videos: Vec<Track>, err: Option<String>, log: Vec<String> },
+    /// 通用提示（发送结果 / 进房失败等）
+    Note(String),
+    Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
 
 fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: std::sync::mpsc::Sender<JobOut>) {
@@ -121,7 +143,7 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                             }
                         },
                         ViewKind::Dynamic => api.dynamic_videos(page)?,
-                        ViewKind::Popular | ViewKind::Queue => anyhow::bail!("该视图不支持翻页"),
+                        ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku => anyhow::bail!("该视图不支持翻页"),
                     })
                 })();
                 let mut r = r;
@@ -162,6 +184,9 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                             if track.aid == 0 {
                                 track.aid = d.aid;
                             }
+                            if track.cid.is_none() {
+                                track.cid = track.pages.first().map(|p| p.cid);
+                            }
                             if track.author.is_empty() {
                                 track.author = d.author;
                             }
@@ -199,6 +224,32 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                 };
                 let _ = tx.send(out);
             }
+            Job::LiveEntry { room } => {
+                if let Err(e) = api.live_entry(room) {
+                    let _ = tx.send(JobOut::Note(format!("进房上报: {}", e)));
+                }
+            }
+            Job::Heartbeat { aid, cid, pos } => {
+                // 失败静默：心跳不是关键路径，别刷屏
+                let _ = api.video_heartbeat(aid, cid, pos);
+            }
+            Job::Say { text, target } => {
+                let r = match target {
+                    SayTarget::Video { cid, bvid, progress } => api.video_send(cid, &bvid, progress, &text),
+                    SayTarget::Live { room } => api.live_send(room, &text),
+                };
+                let _ = tx.send(JobOut::Note(match r {
+                    Ok(m) => m,
+                    Err(e) => format!("{}", e),
+                }));
+            }
+            Job::Rank { room } => {
+                let out = match api.live_gold_rank(room) {
+                    Ok((list, own)) => JobOut::Rank { list, own },
+                    Err(e) => JobOut::Note(format!("高能榜: {}", e)),
+                };
+                let _ = tx.send(out);
+            }
         }
     }
 }
@@ -212,6 +263,7 @@ pub enum ViewKind {
     Queue,
     Space,
     Dynamic,
+    Danmaku,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +383,37 @@ pub struct App {
     repeat: Repeat,
     job_tx: std::sync::mpsc::Sender<Job>,
     job_rx: std::sync::mpsc::Receiver<JobOut>,
+    /// 弹幕：当前轨道收到的行（视频按进度过滤显示，直播实时）
+    dm: Vec<DmLine>,
+    dm_sel: usize,
+    dm_offset: usize,
+    dm_rx: Option<std::sync::mpsc::Receiver<DmEvent>>,
+    dm_stop: Option<Arc<AtomicBool>>,
+    dm_note: String,
+    /// 待确认的发送：(正文, 目标描述, 目标)
+    say_pending: Option<(String, String, SayTarget)>,
+    last_say: Option<std::time::Instant>,
+    say_window: Option<(std::time::Instant, u32)>,
+    /// 播放心跳状态
+    report: Option<Report>,
+    /// 弹幕视图是否自动跟屏
+    dm_follow: bool,
+    /// “自动跟屏”按钮的点击区域
+    follow_btn: Rect,
+    /// 卡顿检测：上次观察到的播放位置与时间
+    stall_mark: Option<(std::time::Instant, f64)>,
+    /// 上次自动重连时间（冷却，避免疯狂重试）
+    recover_at: Option<std::time::Instant>,
+    /// 本次 Play 是卡顿恢复触发的，不要再重建弹幕线程
+    recovering: bool,
+}
+
+struct Report {
+    aid: i64,
+    cid: i64,
+    live: bool,
+    last_pos: f64,
+    last_sent: std::time::Instant,
 }
 
 impl App {
@@ -359,6 +442,7 @@ impl App {
                 View { name: "队列", kind: ViewKind::Queue, items: vec![], sel: 0, offset: 0, hint: "a 添加，d 删除，Enter 播放".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
                 View { name: "UP/合集", kind: ViewKind::Space, items: vec![], sel: 0, offset: 0, hint: ":up <mid|关键词> / :seasons <mid> / :season <BV号>".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
                 View { name: "动态", kind: ViewKind::Dynamic, items: vec![], sel: 0, offset: 0, hint: "关注 UP 的更新与直播（需登录）".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
+                View { name: "弹幕", kind: ViewKind::Danmaku, items: vec![], sel: 0, offset: 0, hint: "按 8 查看；:say <文本> 给当前视频/直播发弹幕；:rank 看高能榜".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
             ],
             view_idx: 1,
             queue: VecDeque::new(),
@@ -382,6 +466,21 @@ impl App {
             repeat: Repeat::Off,
             job_tx,
             job_rx,
+            dm: Vec::new(),
+            dm_sel: 0,
+            dm_offset: 0,
+            dm_rx: None,
+            dm_stop: None,
+            dm_note: String::new(),
+            say_pending: None,
+            last_say: None,
+            say_window: None,
+            report: None,
+            dm_follow: true,
+            follow_btn: Rect::default(),
+            stall_mark: None,
+            recover_at: None,
+            recovering: false,
         };
         app.load_popular();
         app.load_fav();
@@ -398,7 +497,7 @@ pub fn run(cfg: crate::config::Config) -> Result<()> {
     let mut app = App::new(cfg)?;
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -406,7 +505,7 @@ pub fn run(cfg: crate::config::Config) -> Result<()> {
     let result = app.event_loop(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     result
 }
@@ -421,12 +520,16 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
             self.player.tick();
             if event::poll(Duration::from_millis(150))? {
-                if let Event::Key(k) = event::read()? {
-                    self.on_key(k)?;
+                match event::read()? {
+                    Event::Key(k) => self.on_key(k)?,
+                    Event::Mouse(m) => self.on_mouse(m),
+                    _ => {}
                 }
             }
             self.poll_jobs();
+            self.poll_dm();
             self.check_playback();
+            self.tick_report();
             self.check_dl();
             self.check_eof();
             if self.should_quit {
@@ -437,7 +540,7 @@ impl App {
 
     /// TUI 内扫码登录：临时退出全屏，登录后热更新 cookie
     fn do_login(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         println!("扫码登录（Esc / Ctrl-C 取消）\n");
         let r = crate::qrlogin::login(&mut self.cfg);
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
@@ -475,6 +578,7 @@ impl App {
 
     fn check_playback(&mut self) {
         let snap = self.player.snapshot();
+        self.watch_stall(&snap);
         if let Some(err) = snap.error.clone() {
             if self.url_idx + 1 < self.urls.len() {
                 self.url_idx += 1;
@@ -516,6 +620,263 @@ impl App {
             self.auto_next();
         }
         self.last_eof = snap.eof;
+    }
+
+    // ---------------- 弹幕 / 上报 ----------------
+
+    fn stop_dm(&mut self) {
+        if let Some(s) = self.dm_stop.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        self.dm_rx = None;
+        self.report = None;
+    }
+
+    fn start_dm(&mut self, t: &Track) {
+        self.stop_dm();
+        self.dm.clear();
+        self.dm_sel = 0;
+        self.dm_offset = 0;
+        self.dm_note.clear();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<DmEvent>();
+        match t.source {
+            Source::Live => {
+                let room = t.room_id.unwrap_or(0);
+                if room <= 0 {
+                    self.dm_note = "直播间号无效".into();
+                    return;
+                }
+                crate::danmaku::spawn_live(self.cfg.clone(), room, tx, stop.clone());
+            }
+            Source::Video => {
+                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                let aid = t.aid;
+                if cid <= 0 || aid <= 0 {
+                    self.dm_note = format!("缺少 cid/aid，无法拉弹幕（cid={} aid={}）", cid, aid);
+                    return;
+                }
+                crate::danmaku::spawn_video(
+                    self.cfg.clone(),
+                    cid,
+                    aid,
+                    t.duration,
+                    tx,
+                    stop.clone(),
+                );
+            }
+        }
+        self.dm_stop = Some(stop);
+        self.dm_rx = Some(rx);
+    }
+
+    /// 播放开始后登记心跳（视频走 heartbeat，直播走 roomEntryAction）
+    fn start_report(&mut self, t: &Track) {
+        self.report = None;
+        if !self.cfg.logged_in() {
+            return;
+        }
+        match t.source {
+            Source::Live => {
+                let room = t.room_id.unwrap_or(0);
+                if room > 0 {
+                    let _ = self.job_tx.send(Job::LiveEntry { room });
+                    self.report = Some(Report {
+                        aid: 0,
+                        cid: 0,
+                        live: true,
+                        last_pos: 0.0,
+                        last_sent: std::time::Instant::now(),
+                    });
+                }
+            }
+            Source::Video => {
+                let aid = t.aid;
+                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                if aid > 0 && cid > 0 {
+                    self.report = Some(Report {
+                        aid,
+                        cid,
+                        live: false,
+                        last_pos: 0.0,
+                        last_sent: std::time::Instant::now(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// 每 20 秒、且进度前进 ≥5 秒上报一次，避免空转刷播放
+    fn tick_report(&mut self) {
+        let snap = self.player.snapshot();
+        let payload = match &mut self.report {
+            Some(r)
+                if !r.live
+                    && snap.loaded
+                    && !snap.paused
+                    && snap.pos >= 0.0
+                    && (snap.pos - r.last_pos) >= 5.0
+                    && r.last_sent.elapsed() >= Duration::from_secs(20) =>
+            {
+                r.last_pos = snap.pos;
+                r.last_sent = std::time::Instant::now();
+                Some((r.aid, r.cid, snap.pos as u64))
+            }
+            _ => None,
+        };
+        if let Some((aid, cid, pos)) = payload {
+            let _ = self.job_tx.send(Job::Heartbeat { aid, cid, pos });
+        }
+    }
+
+    fn poll_dm(&mut self) {
+        let mut new: Vec<DmLine> = Vec::new();
+        let mut note: Option<String> = None;
+        let mut ended = false;
+        if let Some(rx) = &self.dm_rx {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    DmEvent::Lines(l) => new.extend(l),
+                    DmEvent::Note(n) => note = Some(n),
+                    DmEvent::End => ended = true,
+                }
+            }
+        }
+        if ended {
+            self.dm_rx = None;
+        }
+        if let Some(n) = note {
+            self.dm_note = n;
+        }
+        if new.is_empty() {
+            return;
+        }
+        self.dm.extend(new);
+        // 只保留最近 3000 条
+        if self.dm.len() > 3000 {
+            let cut = self.dm.len() - 3000;
+            self.dm.drain(0..cut);
+        }
+        // 正在看弹幕页且开了自动跟屏，才跟随到底部
+        if self.dm_follow && self.views[self.view_idx].kind == ViewKind::Danmaku {
+            let n = self.dm_visible().len();
+            self.dm_sel = n.saturating_sub(1);
+        }
+    }
+
+    /// 当前应显示的弹幕下标（视频按播放进度过滤，直播全显示）
+    fn dm_visible(&self) -> Vec<usize> {
+        let pos = self.player.snapshot().pos + 0.3;
+        if self.dm_live_mode() {
+            (0..self.dm.len()).collect()
+        } else {
+            self.dm
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.at <= pos)
+                .map(|(i, _)| i)
+                .collect()
+        }
+    }
+
+    fn dm_live_mode(&self) -> bool {
+        matches!(self.current.as_ref().map(|t| t.source), Some(Source::Live))
+    }
+
+    /// 确认后真正发送（限频：≥8 秒一条，每小时 ≤30 条）
+    fn commit_say(&mut self) {
+        let pending = self.say_pending.take();
+        let (text, label, target) = match pending {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(last) = self.last_say {
+            if last.elapsed() < Duration::from_secs(8) {
+                self.status = format!(
+                    "发送太快：距上一条还差 {} 秒",
+                    8 - last.elapsed().as_secs()
+                );
+                return;
+            }
+        }
+        let count = match self.say_window {
+            Some((t, c)) if t.elapsed() < Duration::from_secs(3600) => c,
+            _ => 0,
+        };
+        if count >= 30 {
+            self.status = "已达到每小时 30 条上限，稍后再发".into();
+            return;
+        }
+        self.last_say = Some(std::time::Instant::now());
+        self.say_window = Some((
+            self.say_window
+                .filter(|(t, _)| t.elapsed() < Duration::from_secs(3600))
+                .map(|(t, _)| t)
+                .unwrap_or_else(std::time::Instant::now),
+            count + 1,
+        ));
+        let _ = self.job_tx.send(Job::Say { text, target });
+        self.status = format!("发送中 → {}", label);
+    }
+
+    fn cmd_say(&mut self, arg: &str) {
+        if arg.trim().is_empty() {
+            self.status = "用法：:say <弹幕内容>".into();
+            return;
+        }
+        if !self.cfg.allow_send {
+            self.status =
+                "发送弹幕默认关闭：在 ~/.config/bmus/config.toml 把 allow_send 改为 true 后重启".into();
+            return;
+        }
+        if !self.cfg.logged_in() {
+            self.status = "需要登录（:login 扫码）".into();
+            return;
+        }
+        let t = match self.current.clone() {
+            Some(t) => t,
+            None => {
+                self.status = "没有正在播放的视频/直播".into();
+                return;
+            }
+        };
+        match t.source {
+            Source::Live => {
+                let room = t.room_id.unwrap_or(0);
+                if room <= 0 {
+                    self.status = "当前直播间号无效".into();
+                    return;
+                }
+                let label = format!("直播间 {}（{}）", room, t.title);
+                self.say_pending = Some((arg.trim().to_string(), label, SayTarget::Live { room }));
+            }
+            Source::Video => {
+                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                let bvid = t.bvid.clone().unwrap_or_default();
+                if cid <= 0 || bvid.is_empty() {
+                    self.status = "当前视频缺少 cid/bvid".into();
+                    return;
+                }
+                let pos = self.player.snapshot().pos.max(0.0) as u64;
+                let label = format!("{} @ {}", bvid, fmt_time(pos));
+                self.say_pending =
+                    Some((arg.trim().to_string(), label, SayTarget::Video { cid, bvid, progress: pos }));
+            }
+        }
+    }
+
+    fn show_rank(&mut self) {
+        let room = match self.current.as_ref() {
+            Some(t) if t.source == Source::Live => t.room_id.unwrap_or(0),
+            _ => 0,
+        };
+        if room <= 0 {
+            self.status = "先播放一个直播间，再看高能榜".into();
+            return;
+        }
+        let _ = self.job_tx.send(Job::Rank { room });
+        self.status = "拉取高能榜…".into();
     }
 
     // ---------------- 加载 ----------------
@@ -592,6 +953,9 @@ impl App {
             ViewKind::Queue => self.sync_queue_view(),
             ViewKind::Space => self.status = "用 :up / :seasons / :season 重新载入".into(),
             ViewKind::Dynamic => self.load_dynamic(),
+            ViewKind::Danmaku => {
+                self.status = "弹幕视图：:say 发弹幕 / :rank 看高能榜 / Enter 跳到该时间点".into()
+            }
         }
     }
 
@@ -770,6 +1134,7 @@ impl App {
         self.player.stop();
         self.current = None;
         self.cur_page = None;
+        self.stop_dm();
         self.sync_queue_view();
     }
 
@@ -942,11 +1307,54 @@ impl App {
                     } else {
                         Some(track.pages.iter().position(|p| Some(p.cid) == track.cid).unwrap_or(0))
                     };
-                    self.stream_label = label;
+                    self.stream_label = label.clone();
+                    let track2 = track.clone();
                     self.current = Some(track);
                     self.last_eof = false;
                     self.play_at = Some(std::time::Instant::now());
+                    if self.recovering {
+                        self.recovering = false;
+                        self.status = format!("已自动恢复播放 · {}", label);
+                    } else {
+                        self.start_dm(&track2);
+                        self.start_report(&track2);
+                    }
                     self.sync_queue_view();
+                }
+                JobOut::Note(m) => self.status = m,
+                JobOut::Rank { list, own } => {
+                    let room = self
+                        .current
+                        .as_ref()
+                        .filter(|t| t.source == Source::Live)
+                        .and_then(|t| t.room_id)
+                        .unwrap_or(0);
+                    for (name, score, rank) in list {
+                        self.dm.push(DmLine {
+                            at: 0.0,
+                            user: format!("#{}", rank),
+                            text: format!("{}  {} 分", name, score),
+                            color: 0xFF_D7_00,
+                            mode: 2,
+                            kind: DmKind::Rank,
+                        });
+                    }
+                    let tail = match own {
+                        Some((n, s, r)) => {
+                            let rk = if r < 0 { "未上榜".to_string() } else { format!("第 {} 名", r) };
+                            format!("自己（{}）{} · {} 分", n, rk, s)
+                        }
+                        None => "自己未上榜（高能榜按互动/消费计分，只听音频不会上榜）".into(),
+                    };
+                    self.status = if room > 0 {
+                        format!("高能榜已载入（room {}）｜{}", room, tail)
+                    } else {
+                        "高能榜已载入".into()
+                    };
+                    if self.views[self.view_idx].kind == ViewKind::Danmaku {
+                        let n = self.dm_visible().len();
+                        self.dm_sel = n.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -1027,7 +1435,7 @@ impl App {
             let v = &self.views[self.view_idx];
             (v.kind, v.page + 1, v.keyword.clone(), v.source_id, v.source_kind, v.source_mid)
         };
-        if matches!(kind, ViewKind::Popular | ViewKind::Queue) {
+        if matches!(kind, ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku) {
             self.status = "该视图不支持翻页".into();
             return;
         }
@@ -1254,6 +1662,8 @@ impl App {
             }
             "season" => self.cmd_season(arg),
             "dynamic" | "feed" => self.load_dynamic(),
+            "say" => self.cmd_say(arg),
+            "rank" | "gold" => self.show_rank(),
             "like" => self.act_like(true),
             "star" | "collect" => self.act_fav(true),
             "unstar" | "uncollect" => self.act_fav(false),
@@ -1402,6 +1812,19 @@ impl App {
             return Ok(());
         }
 
+        if let Some((_, label, _)) = self.say_pending.clone() {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.commit_say(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.say_pending = None;
+                    self.status = "已取消发送".into();
+                }
+                _ => {}
+            }
+            let _ = label;
+            return Ok(());
+        }
+
         if self.help {
             self.help = false;
             return Ok(());
@@ -1433,12 +1856,28 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::PageDown => self.move_sel(10),
             KeyCode::PageUp => self.move_sel(-10),
-            KeyCode::Home | KeyCode::Char('g') => self.views[self.view_idx].sel = 0,
-            KeyCode::End | KeyCode::Char('G') => {
-                let len = self.views[self.view_idx].items.len();
-                self.views[self.view_idx].sel = len.saturating_sub(1);
+            KeyCode::Home | KeyCode::Char('g') => {
+                if self.views[self.view_idx].kind == ViewKind::Danmaku {
+                    self.dm_sel = 0;
+                } else {
+                    self.views[self.view_idx].sel = 0;
+                }
             }
-            KeyCode::Enter | KeyCode::Char('x') => self.activate_selected(),
+            KeyCode::End | KeyCode::Char('G') => {
+                if self.views[self.view_idx].kind == ViewKind::Danmaku {
+                    self.dm_sel = self.dm_visible().len().saturating_sub(1);
+                } else {
+                    let len = self.views[self.view_idx].items.len();
+                    self.views[self.view_idx].sel = len.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('x') => {
+                if self.views[self.view_idx].kind == ViewKind::Danmaku {
+                    self.jump_to_dm()
+                } else {
+                    self.activate_selected()
+                }
+            }
             KeyCode::Char('a') => self.enqueue_selected(),
             KeyCode::Char('d') => self.remove_selected(),
             KeyCode::Char('D') => {
@@ -1454,7 +1893,17 @@ impl App {
             KeyCode::Char('s') => {
                 self.player.stop();
                 self.current = None;
+                self.stop_dm();
                 self.status = "已停止".into();
+            }
+            KeyCode::Char('8') => self.view_idx = 7,
+            KeyCode::Char('t') => {
+                let cur = self.view_idx;
+                self.view_idx = 7;
+                if cur != 7 {
+                    let n = self.dm_visible().len();
+                    self.dm_sel = n.saturating_sub(1);
+                }
             }
             KeyCode::Char('n') => self.next_track(),
             KeyCode::Char('p') => {
@@ -1532,18 +1981,115 @@ impl App {
             }
             KeyCode::Char(':') => self.input = Some((":".into(), String::new())),
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('f') => {
+                self.dm_follow = !self.dm_follow;
+                self.status = if self.dm_follow {
+                    "弹幕自动跟屏：开".into()
+                } else {
+                    "弹幕自动跟屏：关（j/k 翻看历史）".into()
+                };
+            }
             _ => {}
         }
         Ok(())
     }
 
+    fn on_mouse(&mut self, m: MouseEvent) {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let btn = self.follow_btn;
+            if btn.width > 0
+                && m.column >= btn.x
+                && m.column < btn.x + btn.width
+                && m.row == btn.y
+            {
+                self.dm_follow = !self.dm_follow;
+                self.status = if self.dm_follow {
+                    "弹幕自动跟屏：开".into()
+                } else {
+                    "弹幕自动跟屏：关（j/k 翻看历史）".into()
+                };
+            }
+        }
+    }
+
+    /// 播放卡住（位置 12 秒不动）时先切备用 CDN，再不行重新解析地址
+    fn watch_stall(&mut self, snap: &crate::mpv::Snapshot) {
+        let playing = self.current.is_some() && snap.loaded && !snap.paused && !snap.eof;
+        if !playing {
+            self.stall_mark = None;
+            return;
+        }
+        match self.stall_mark {
+            Some((at, pos)) if (snap.pos - pos).abs() > 0.5 => {
+                self.stall_mark = Some((std::time::Instant::now(), snap.pos));
+                let _ = at;
+            }
+            Some((at, pos)) if at.elapsed() >= Duration::from_secs(12) => {
+                if std::env::var("BMUS_DEBUG_STALL").is_ok() {
+                    eprintln!("stall detected: {:.2}s at pos {:.2}", at.elapsed().as_secs_f64(), pos);
+                }
+                if let Some(t) = self.recover_at {
+                    if t.elapsed() < Duration::from_secs(20) {
+                        return;
+                    }
+                }
+                self.recover_at = Some(std::time::Instant::now());
+                // 先换备用 CDN，不动弹幕/上报
+                if self.url_idx + 1 < self.urls.len() {
+                    self.url_idx += 1;
+                    let url = self.urls[self.url_idx].clone();
+                    let title = self.current.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+                    let live = self.current.as_ref().map(|t| t.source == Source::Live).unwrap_or(false);
+                    self.player.play_url(&url, &title, live);
+                    self.status = format!("播放卡顿 {}s，已切换备用 CDN #{}", at.elapsed().as_secs(), self.url_idx + 1);
+                    self.play_at = Some(std::time::Instant::now());
+                    self.stall_mark = Some((std::time::Instant::now(), pos));
+                } else if let Some(t) = self.current.clone() {
+                    self.recovering = true;
+                    self.status = "播放卡顿，重新解析地址…".into();
+                    self.play_track(t);
+                    self.stall_mark = None;
+                    self.play_at = Some(std::time::Instant::now());
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.stall_mark = Some((std::time::Instant::now(), snap.pos));
+            }
+        }
+    }
+
     fn move_sel(&mut self, delta: isize) {
+        if self.views[self.view_idx].kind == ViewKind::Danmaku {
+            let n = self.dm_visible().len();
+            if n == 0 {
+                return;
+            }
+            self.dm_sel = (self.dm_sel as isize + delta).clamp(0, n as isize - 1) as usize;
+            return;
+        }
         let v = &mut self.views[self.view_idx];
         if v.items.is_empty() {
             return;
         }
         let new = v.sel as isize + delta;
         v.sel = new.clamp(0, v.items.len() as isize - 1) as usize;
+    }
+
+    fn jump_to_dm(&mut self) {
+        if self.dm_live_mode() {
+            self.status = "直播弹幕没有时间轴，无法跳转".into();
+            return;
+        }
+        let vis = self.dm_visible();
+        let idx = match vis.get(self.dm_sel) {
+            Some(&i) => i,
+            None => return,
+        };
+        let at = self.dm[idx].at;
+        let pos = self.player.snapshot().pos;
+        self.player.seek_relative(at - pos);
+        self.status = format!("跳到弹幕时间点 {}", fmt_time(at.max(0.0) as u64));
     }
 
     fn remove_selected(&mut self) {
@@ -1597,6 +2143,9 @@ impl App {
         }
         self.draw_hints(f, chunks[4]);
 
+        if self.say_pending.is_some() {
+            self.draw_say_dialog(f);
+        }
         if self.help {
             self.draw_help(f, area);
         }
@@ -1664,6 +2213,10 @@ impl App {
             cols[0],
         );
 
+        if self.views[self.view_idx].kind == ViewKind::Danmaku {
+            self.draw_danmaku(f, cols[1]);
+            return;
+        }
         let v = &mut self.views[self.view_idx];
         let inner_h = cols[1].height.saturating_sub(2) as usize;
         if v.sel < v.offset {
@@ -1725,6 +2278,133 @@ impl App {
             ),
             cols[1],
         );
+    }
+
+    fn draw_danmaku(&mut self, f: &mut Frame, area: Rect) {
+        let vis = self.dm_visible();
+        let inner_h = area.height.saturating_sub(2) as usize;
+        if self.dm_sel >= vis.len() {
+            self.dm_sel = vis.len().saturating_sub(1);
+        }
+        if self.dm_sel < self.dm_offset {
+            self.dm_offset = self.dm_sel;
+        }
+        if inner_h > 0 && self.dm_sel >= self.dm_offset + inner_h {
+            self.dm_offset = self.dm_sel + 1 - inner_h;
+        }
+        let mode = if self.dm_live_mode() { "直播" } else { "视频" };
+        let title = if self.dm_note.is_empty() {
+            format!(" 弹幕 · {} · {} 条 · Enter 跳到该时间点 ", mode, vis.len())
+        } else {
+            format!(" 弹幕 · {} · {} 条 · {} ", mode, vis.len(), self.dm_note)
+        };
+
+        let width = area.width.saturating_sub(4) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        if vis.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if self.current.is_some() {
+                    "  (等待弹幕…)"
+                } else {
+                    "  (先播放视频或直播)"
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (i, &idx) in vis.iter().enumerate().skip(self.dm_offset).take(inner_h) {
+            let l = &self.dm[idx];
+            let cur = i == self.dm_sel;
+            let tag = match l.kind {
+                DmKind::Gift => "[礼]",
+                DmKind::SuperChat => "[SC]",
+                DmKind::Rank => "[榜]",
+                DmKind::Danmu => match l.mode {
+                    4 => "[底]",
+                    5 => "[顶]",
+                    _ => "",
+                },
+            };
+            let ts = if self.dm_live_mode() {
+                "     ".to_string()
+            } else {
+                format!("{:>5}", fmt_time(l.at.max(0.0) as u64))
+            };
+            let who = if l.user.is_empty() {
+                String::new()
+            } else {
+                format!("{}: ", l.user)
+            };
+            let head = format!("{} {}{}{}", ts, tag, who, l.text);
+            let row = fit(&head, width);
+            let base = if l.color == 0 || l.color == 0xFF_FF_FF {
+                Color::Gray
+            } else {
+                Color::Rgb(
+                    ((l.color >> 16) & 0xFF) as u8,
+                    ((l.color >> 8) & 0xFF) as u8,
+                    (l.color & 0xFF) as u8,
+                )
+            };
+            let color = match l.kind {
+                DmKind::Gift => Color::Rgb(255, 193, 7),
+                DmKind::SuperChat => Color::Rgb(255, 102, 153),
+                DmKind::Rank => Color::Yellow,
+                _ => base,
+            };
+            let style = if cur {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            lines.push(Line::from(Span::styled(row, style)));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(title, Style::default().fg(Color::Gray))),
+            ),
+            area,
+        );
+    }
+
+    fn draw_say_dialog(&self, f: &mut Frame) {
+        let (text, label, _) = match &self.say_pending {
+            Some(p) => p,
+            None => return,
+        };
+        let area = f.size();
+        let w = 72.min(area.width.saturating_sub(4));
+        let h = 4;
+        let popup = Rect {
+            x: (area.width.saturating_sub(w)) / 2,
+            y: area.height.saturating_sub(9),
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, popup);
+        let para = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("发送: ", Style::default().fg(Color::Yellow)),
+                Span::styled(text.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(Span::styled(
+                format!("目标: {}", label),
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                "y / Enter 发送    n / Esc 取消",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(" 确认发送弹幕 ", Style::default().fg(Color::Yellow))),
+        );
+        f.render_widget(para, popup);
     }
 
     fn draw_gauge(&self, f: &mut Frame, area: Rect) {
@@ -1790,12 +2470,37 @@ impl App {
         f.render_widget(Paragraph::new(text), area);
     }
 
-    fn draw_hints(&self, f: &mut Frame, area: Rect) {
-        let hint = " Enter 播放/进入  a 入队  space 暂停  n 下一首  [/] 分P  > 翻页  ,/. ±1min  c 收藏  v 点赞  w 下载  / 搜索  : 命令  ? 帮助  q 退出";
+    fn draw_hints(&mut self, f: &mut Frame, area: Rect) {
+        let hint = " Enter 播放  a 入队  space 暂停  n 下一首  [/] 分P  8 弹幕  :say 发弹幕  > 翻页  c 收藏  v 点赞  w 下载  / 搜索  : 命令  ? 帮助  q 退出";
+        let danmaku = self.views[self.view_idx].kind == ViewKind::Danmaku;
+        let label = if self.dm_follow { " 自动跟屏:开 " } else { " 自动跟屏:关 " };
+        let label_w = if danmaku {
+            unicode_width::UnicodeWidthStr::width(label) as u16
+        } else {
+            0
+        };
+        let text = fit(hint, area.width.saturating_sub(label_w) as usize);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))),
             area,
         );
+        if danmaku && label_w > 0 && area.width > label_w {
+            let r = Rect {
+                x: area.right().saturating_sub(label_w),
+                y: area.y,
+                width: label_w,
+                height: 1,
+            };
+            let style = if self.dm_follow {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray).bg(Color::DarkGray)
+            };
+            f.render_widget(Paragraph::new(Span::styled(label, style)), r);
+            self.follow_btn = r;
+        } else {
+            self.follow_btn = Rect::default();
+        }
     }
 
     fn draw_help(&self, f: &mut Frame, area: Rect) {
@@ -1818,7 +2523,7 @@ impl App {
             Line::from("  h/l ←/→   ±10s    ,/. ±60s   +/-       音量"),
             Line::from("  c / C     收藏 / 取消收藏    v         点赞（接口原样）"),
             Line::from("  L         省流开关           r         刷新          w  下载(音频转码)\n  R         播放模式(单曲/循环/随机)  [/] 分P  >/< 翻页"),
-            Line::from("  1-7/Tab   切换视图 7=动态    g/G       首行/末行"),
+            Line::from("  1-8/Tab   切换视图 7=动态 8=弹幕  g/G    首行/末行"),
             Line::from("  [/] 切换分P                   >/<       视图翻页(>)
   / 搜索    q 退出"),
             Line::from(""),
@@ -1831,6 +2536,13 @@ impl App {
             Line::from("  :like :star :unstar            点赞 / 收藏（选中项）
   :dl <BV|链接> [P]               下载音频（opus>m4a>mp3）"),
             Line::from("  :play <BV|链接>  :add <BV>  :search <词>  :live <房间号>"),
+            Line::from(""),
+            Line::from(Span::styled(" 弹幕 / 数据", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+            Line::from("  t / 8            打开弹幕视图（Enter 跳到该条时间点）"),
+            Line::from("  :say <文本>      给当前视频/直播发弹幕（需 allow_send=true）"),
+            Line::from("  :rank            看当前直播间高能榜（只读）"),
+            Line::from("  播放自动上报：视频每 20s 心跳，直播进房即计观看"),
+            Line::from("  默认 8s/条、30 条/小时；失败不自动重试，避免风控"),
         ];
         f.render_widget(
             Paragraph::new(text)

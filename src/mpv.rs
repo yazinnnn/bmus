@@ -53,6 +53,8 @@ pub struct Mpv {
     pending: Arc<Mutex<std::collections::HashMap<u64, Prop>>>,
     next_id: AtomicU64,
     child: Arc<Mutex<Child>>,
+    /// unix 下是 socket 路径；Windows 走 TCP，不用这个字段
+    #[cfg_attr(windows, allow(dead_code))]
     ipc: PathBuf,
     cookie: Mutex<String>,
     log_path: PathBuf,

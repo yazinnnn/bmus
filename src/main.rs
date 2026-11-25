@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod danmaku;
 mod db;
 mod download;
 mod mpv;

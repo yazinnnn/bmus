@@ -2,12 +2,20 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const REF_VIDEO: &str = "https://www.bilibili.com/";
 const REF_LIVE: &str = "https://live.bilibili.com/";
+
+/// wbi mixin 重排表（B 站 web 端固定顺序）
+const MIXIN_TAB: [usize; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19,
+    29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30,
+    4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -69,6 +77,8 @@ pub struct Api {
     http: reqwest::blocking::Client,
     cookie: Mutex<String>,
     wbi: Mutex<Option<(String, String)>>,
+    /// 当前登录用户 mid（未登录为 0）
+    mid: i64,
     /// best / lowest / 30216 ...
     pub audio_quality: String,
     /// 上一次请求时间，用于全局限速（避免 -799 / 412）
@@ -84,6 +94,7 @@ impl Api {
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(8))
             .gzip(true)
+            .deflate(false)
             .build()?;
 
         let mut cookie = cfg.cookie();
@@ -111,6 +122,7 @@ impl Api {
             http,
             cookie: Mutex::new(cookie),
             wbi: Mutex::new(None),
+            mid: cfg.dede_user_id.trim().parse::<i64>().unwrap_or(0),
             audio_quality: cfg.audio_quality.clone(),
             pace: Mutex::new(None),
             detail_cache: Mutex::new(std::collections::HashMap::new()),
@@ -299,28 +311,24 @@ impl Api {
         Ok(k)
     }
 
-    /// 返回带 w_rid/wts 的 query string（值已编码）
-    fn signed_query(&self, mut params: Vec<(String, String)>) -> Result<String> {
-        const TAB: [usize; 64] = [
-            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42,
-            19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60,
-            51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
-        ];
+    /// 补 wts、排序、算 w_rid；返回（带 wts 的参数表, 可直接拼到 url 的 query）
+    fn wbi_sign(&self, mut params: Vec<(String, String)>) -> Result<(Vec<(String, String)>, String)> {
         let (img, sub) = self.wbi_keys()?;
         let raw = format!("{}{}", img, sub);
-        let mixin: Vec<char> = TAB
+        let mixin: String = MIXIN_TAB
             .iter()
             .take(32)
             .filter_map(|&i| raw.chars().nth(i))
             .collect();
-        let mixin: String = mixin.into_iter().collect();
 
-        let wts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-        params.push(("wts".into(), wts));
+        if !params.iter().any(|(k, _)| k == "wts") {
+            let wts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string();
+            params.push(("wts".into(), wts));
+        }
         params.sort_by(|a, b| a.0.cmp(&b.0));
         let query: String = params
             .iter()
@@ -331,7 +339,12 @@ impl Api {
             .collect::<Vec<_>>()
             .join("&");
         let w_rid = format!("{:x}", md5::compute(format!("{}{}", query, mixin)));
-        Ok(format!("{}&w_rid={}", query, w_rid))
+        Ok((params.clone(), format!("{}&w_rid={}", query, w_rid)))
+    }
+
+    /// 返回带 w_rid/wts 的 query string（值已编码）
+    fn signed_query(&self, params: Vec<(String, String)>) -> Result<String> {
+        Ok(self.wbi_sign(params)?.1)
     }
 
     // ---------- 列表类接口 ----------
@@ -730,7 +743,348 @@ impl Api {
             .ok_or_else(|| anyhow!("没搜到「{}」", s))?;
         Ok(first)
     }
+
+    // ---------- 弹幕 / 播放上报 / 高能榜 ----------
+
+    /// 原始文本 GET（弹幕 XML 这类非 JSON 接口）
+    fn raw_text(&self, url: &str, referer: &str) -> Result<String> {
+        for attempt in 0..3u32 {
+            self.pace();
+            let mut r = self
+                .http
+                .get(url)
+                .header("Referer", referer)
+                .header("User-Agent", UA);
+            let ck = self.cookie();
+            if !ck.is_empty() {
+                r = r.header("Cookie", ck);
+            }
+            match r.send() {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.as_u16() == 412 || status.as_u16() == 403 {
+                        std::thread::sleep(Duration::from_millis(1500u64 * (attempt as u64 + 1)));
+                        continue;
+                    }
+                    let raw = resp.bytes().unwrap_or_default();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    if let Ok(t) = std::str::from_utf8(&raw) {
+                        if t.trim_start().starts_with('<') || t.trim_start().starts_with('{') {
+                            return Ok(t.to_string());
+                        }
+                    }
+                    // B 站弹幕 XML 用 raw deflate，reqwest 不自动解，自己来
+                    for dec in ["zlib", "deflate"] {
+                        let out = if dec == "zlib" {
+                            let mut d = flate2::read::ZlibDecoder::new(&raw[..]);
+                            let mut v = Vec::new();
+                            d.read_to_end(&mut v).map(|_| v)
+                        } else {
+                            let mut d = flate2::read::DeflateDecoder::new(&raw[..]);
+                            let mut v = Vec::new();
+                            d.read_to_end(&mut v).map(|_| v)
+                        };
+                        if let Ok(v) = out {
+                            if let Ok(t) = String::from_utf8(v) {
+                                return Ok(t);
+                            }
+                        }
+                    }
+                    bail!("弹幕响应无法解码（{} 字节）", raw.len())
+                }
+                Err(e) => {
+                    if attempt == 2 {
+                        bail!("请求失败: {}", e);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        bail!("弹幕接口无响应（可能被限流）")
+    }
+
+    /// 普通 POST 表单（心跳这类不需要 wbi 的写接口）
+    fn form_post(
+        &self,
+        base: &str,
+        referer: &str,
+        params: &[(String, String)],
+    ) -> Result<Value> {
+        self.pace();
+        let body = params
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(k),
+                    urlencoding::encode(v)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let origin = referer
+            .split('/')
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut r = self
+            .http
+            .post(base)
+            .header("Referer", referer)
+            .header("Origin", origin)
+            .header("User-Agent", UA)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body);
+        let ck = self.cookie();
+        if !ck.is_empty() {
+            r = r.header("Cookie", ck);
+        }
+        let text = r.send()?.text().unwrap_or_default();
+        serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("接口返回非 JSON（可能触发风控）: {}", text.chars().take(80).collect::<String>()))
+    }
+
+    /// wbi 签名的 POST：query 与 body 带同一批参数（B 站写接口按这个口径校验）
+    fn signed_post(
+        &self,
+        base: &str,
+        referer: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<Value> {
+        let (p, q) = self.wbi_sign(params)?;
+        let url = format!("{}{}{}", base, if base.contains('?') { "&" } else { "?" }, q);
+        self.pace();
+        let body = p
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let origin = referer.split('/').take(3).collect::<Vec<_>>().join("/");
+        let mut r = self
+            .http
+            .post(&url)
+            .header("Referer", referer)
+            .header("Origin", origin)
+            .header("User-Agent", UA)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body);
+        let ck = self.cookie();
+        if !ck.is_empty() {
+            r = r.header("Cookie", ck);
+        }
+        let text = r.send()?.text().unwrap_or_default();
+        serde_json::from_str::<Value>(&text).with_context(|| {
+            format!(
+                "接口返回非 JSON（可能触发风控）: {}",
+                text.chars().take(80).collect::<String>()
+            )
+        })
+    }
+
+    /// 视频弹幕 XML（每 360 秒一段，segment_index 从 1 开始）
+    pub fn dm_xml(&self, cid: i64, aid: i64, segment: u32) -> Result<String> {
+        let url = format!(
+            "https://api.bilibili.com/x/v1/dm/list.so?type=1&oid={}&pid={}&segment_index={}",
+            cid, aid, segment
+        );
+        self.raw_text(&url, "https://www.bilibili.com/")
+    }
+
+    /// 直播弹幕连接信息：token + 可用 comet 节点
+    pub fn live_danmu_info(&self, room: i64) -> Result<(String, Vec<String>)> {
+        let params = vec![
+            ("id".to_string(), room.to_string()),
+            ("type".to_string(), "0".to_string()),
+        ];
+        let q = self.signed_query(params)?;
+        let url = format!(
+            "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?{}",
+            q
+        );
+        let v = self.data(&url, &format!("https://live.bilibili.com/{}", room))?;
+        let token = v["token"].as_str().unwrap_or("").to_string();
+        let hosts: Vec<String> = v["host_list"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|h| h["host"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if token.is_empty() || hosts.is_empty() {
+            bail!("getDanmuInfo 没有返回 token（未登录或风控）");
+        }
+        Ok((token, hosts))
+    }
+
+    /// 视频播放心跳：B 站靠它统计播放与写历史
+    pub fn video_heartbeat(&self, aid: i64, cid: i64, played: u64) -> Result<()> {
+        if !self.logged_in() || self.mid == 0 {
+            return Ok(());
+        }
+        let csrf = self
+            .csrf()
+            .ok_or_else(|| anyhow!("未登录（:login 扫码后才有 bili_jct）"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let start = now.saturating_sub(played);
+        let params = vec![
+            ("aid".to_string(), aid.to_string()),
+            ("cid".to_string(), cid.to_string()),
+            ("mid".to_string(), self.mid.to_string()),
+            ("type".to_string(), "3".to_string()),
+            ("sub_type".to_string(), "0".to_string()),
+            ("played_time".to_string(), played.to_string()),
+            ("real_played_time".to_string(), played.to_string()),
+            ("realtime".to_string(), played.to_string()),
+            ("start_ts".to_string(), start.to_string()),
+            ("dt".to_string(), "2".to_string()),
+            ("last_play_progress_time".to_string(), played.to_string()),
+            ("play_type".to_string(), "0".to_string()),
+            ("csrf".to_string(), csrf),
+        ];
+        let v = self.form_post(
+            "https://api.bilibili.com/x/click-interface/web/heartbeat",
+            REF_VIDEO,
+            &params,
+        )?;
+        if v["code"].as_i64() != Some(0) {
+            bail!(
+                "心跳失败 {}: {}",
+                v["code"],
+                v["message"].as_str().unwrap_or("")
+            );
+        }
+        Ok(())
+    }
+
+    /// 直播进房（计入观看，并写直播历史）
+    pub fn live_entry(&self, room: i64) -> Result<()> {
+        if !self.logged_in() {
+            return Ok(());
+        }
+        let csrf = self
+            .csrf()
+            .ok_or_else(|| anyhow!("未登录（:login 扫码后才有 bili_jct）"))?;
+        let params = vec![
+            ("room_id".to_string(), room.to_string()),
+            ("platform".to_string(), "web".to_string()),
+            ("csrf".to_string(), csrf),
+        ];
+        let v = self.form_post(
+            "https://api.live.bilibili.com/xlive/web-room/v1/index/roomEntryAction",
+            &format!("https://live.bilibili.com/{}", room),
+            &params,
+        )?;
+        if v["code"].as_i64() != Some(0) {
+            bail!("进房失败 {}: {}", v["code"], v["message"].as_str().unwrap_or(""));
+        }
+        Ok(())
+    }
+
+    /// 发直播弹幕
+    pub fn live_send(&self, room: i64, text: &str) -> Result<String> {
+        let csrf = self
+            .csrf()
+            .ok_or_else(|| anyhow!("未登录（:login 扫码后才有 bili_jct）"))?;
+        let rnd = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        let params = vec![
+            ("bubble".to_string(), "0".to_string()),
+            ("color".to_string(), "16777215".to_string()),
+            ("fontsize".to_string(), "25".to_string()),
+            ("mode".to_string(), "1".to_string()),
+            ("msg".to_string(), text.to_string()),
+            ("rnd".to_string(), rnd),
+            ("roomid".to_string(), room.to_string()),
+            ("csrf".to_string(), csrf.clone()),
+            ("csrf_token".to_string(), csrf),
+            ("web_location".to_string(), "444.8".to_string()),
+        ];
+        let v = self.signed_post(
+            "https://api.live.bilibili.com/msg/send",
+            &format!("https://live.bilibili.com/{}", room),
+            params,
+        )?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            bail!("发送失败 {}: {}", code, v["message"].as_str().unwrap_or(""));
+        }
+        Ok("直播弹幕已发送".into())
+    }
+
+    /// 发视频弹幕（progress 为秒）
+    pub fn video_send(&self, cid: i64, bvid: &str, progress: u64, text: &str) -> Result<String> {
+        let csrf = self
+            .csrf()
+            .ok_or_else(|| anyhow!("未登录（:login 扫码后才有 bili_jct）"))?;
+        let params = vec![
+            ("type".to_string(), "1".to_string()),
+            ("oid".to_string(), cid.to_string()),
+            ("msg".to_string(), text.to_string()),
+            ("color".to_string(), "16777215".to_string()),
+            ("fontsize".to_string(), "25".to_string()),
+            ("pool".to_string(), "0".to_string()),
+            ("mode".to_string(), "1".to_string()),
+            ("progress".to_string(), progress.to_string()),
+            ("plat".to_string(), "1".to_string()),
+            ("csrf".to_string(), csrf),
+            ("bvid".to_string(), bvid.to_string()),
+            ("web_location".to_string(), "333.1007".to_string()),
+        ];
+        let v = self.signed_post(
+            "https://api.bilibili.com/x/v2/dm/post",
+            &format!("https://www.bilibili.com/video/{}", bvid),
+            params,
+        )?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let msg = match code {
+                36701 => "弹幕包含被禁止的内容".to_string(),
+                36702 => "弹幕超过 100 字".to_string(),
+                36703 => "该视频禁止发送弹幕".to_string(),
+                _ => v["message"].as_str().unwrap_or("").to_string(),
+            };
+            bail!("发送失败 {}: {}", code, msg);
+        }
+        Ok("视频弹幕已发送".into())
+    }
+
+    /// 直播间高能榜（只读）：返回 (名字, 分数, 名次)，另附自己的名次
+    pub fn live_gold_rank(&self, room: i64) -> Result<(Vec<(String, i64, i64)>, Option<(String, i64, i64)>)> {
+        let url = format!(
+            "https://api.live.bilibili.com/xlive/general-interface/v1/rank/queryContributionRank?room_id={}&ruid={}&page=1&page_size=10",
+            room, self.mid
+        );
+        let v = self.data(&url, &format!("https://live.bilibili.com/{}", room))?;
+        let mut list: Vec<(String, i64, i64)> = Vec::new();
+        if let Some(items) = v["item"].as_array() {
+            for it in items {
+                list.push((
+                    it["name"].as_str().unwrap_or("?").to_string(),
+                    it["score"].as_i64().unwrap_or(0),
+                    it["rank"].as_i64().unwrap_or(0),
+                ));
+            }
+        }
+        let own = v["own_info"]["name"].as_str().map(|n| {
+            (
+                n.to_string(),
+                v["own_info"]["score"].as_i64().unwrap_or(0),
+                v["own_info"]["rank"].as_i64().unwrap_or(-1),
+            )
+        });
+        Ok((list, own))
+    }
 }
+
 
 fn strip_html(s: &str) -> String {
     let mut out = String::new();

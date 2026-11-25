@@ -57,6 +57,14 @@ cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus）：视频、�
 | 设备指纹 | `/x/frontend/finger/spi` |
 | 登录二维码 | `/x/passport-login/web/qrcode/generate`、`/qrcode/poll`（凭证在轮询响应的 `Set-Cookie`） |
 | 当前用户 | `/x/web-interface/nav` |
+| 视频弹幕 | `/x/v1/dm/list.so?oid=&pid=&segment_index=`（raw deflate 的 XML） |
+| 直播弹幕 token/节点 | `/xlive/web-room/v1/index/getDanmuInfo`（wbi） |
+| 直播弹幕流 | `wss://<host>/sub`（握手 op=7、心跳 op=2、protover=3 → brotli） |
+| 发视频弹幕 | `POST /x/v2/dm/post`（wbi + csrf） |
+| 发直播弹幕 | `POST /msg/send`（wbi + csrf + csrf_token） |
+| 视频播放上报 | `POST /x/click-interface/web/heartbeat` |
+| 直播进房上报 | `POST /xlive/web-room/v1/index/roomEntryAction` |
+| 直播间高能榜 | `/xlive/general-interface/v1/rank/queryContributionRank` |
 
 ## 实现思路
 
@@ -67,7 +75,12 @@ cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus）：视频、�
 5. **翻页与风控。** 搜索/热门/收藏/UP/合集/播放列表/动态都支持 `>` 追加下一页；合集与播放列表每页 100 条尽量一页装完；全局请求间隔 700ms，命中 `-799/-352/-509/-412` 或 HTTP 412 时按 1.5s→3.5s→7s 退避，worker 再等 25s 重试一次。
 6. **登录态。** `:login` 拉二维码、用半块字符在终端渲染、轮询结果，凭证从 `Set-Cookie` 解析后写入 `config.toml`（600）。`buvid3/buvid4` 首次运行自动获取，缺失会被判风控。
 7. **下载与归档。** 音轨先落临时文件，再按 opus → m4a(AAC) → mp3 顺序用 ffmpeg 转封装/转码（源码率高于 `max_bitrate` 才压到该值），写入 title/artist/date/comment（原始链接含 `?p=N`）/bvid。没有 ffmpeg 时降级为原样保存（无元数据）。多分P一次下全；重下按 `pubdate` 比对跳过。UP 目录名在 SQLite 里与 `uid` 绑定，只取第一次创建的名字，改名不会新建文件夹。
-8. **纯 Rust 运行时。** 除 mpv/libmpv 与可选 ffmpeg，HTTP/TLS/JSON/SQLite 全部编进二进制：`reqwest`+`rustls`（不依赖系统 OpenSSL）、`serde_json`、`rusqlite`（bundled）。交叉编译只需处理 `ring` 那一点汇编。
+8. **弹幕引擎。** 视频走 XML 分段接口，`raw deflate` 自己解（reqwest 不解裸 deflate），解析 `<d p="时间,模式,字号,颜色,…">`；公共服务端无视 `segment_index`，几段返回同一份内容，因此按内容摘要去重、内容不变即停止翻段。直播走 comet WebSocket：`getDanmuInfo`（wbi 签名）取 token+节点，握手 `op=7`、25 秒心跳 `op=2`、`protover=3` 的分包用 brotli 解、`protover=2` 用 zlib 解，逐层拆包后按 `cmd` 取 `DANMU_MSG`/`SEND_GIFT`/`SUPER_CHAT_MESSAGE`/`GUARD_BUY`。线程独立于 UI，token 按房间缓存，只有首连/认证失败/节点全挂才重新请求。
+9. **播放计入数据。** 视频每 20 秒发一次心跳（且进度必须前进 ≥5 秒，暂停/空转不发），`played_time/real_played_time` 用真实进度，B 站据此写播放历史；直播播放时调 `roomEntryAction` 进房，历史里会出现该直播间。`ffprobe`/`mpv` 侧不参与上报。
+10. **卡顿自愈。** 播放中位置连续 12 秒不动（暂停/结束不算）即判卡顿：先切备用 CDN，URL 用完就重新解析播放地址；20 秒冷却避免死循环，恢复时不重建弹幕线程与上报状态。
+11. **配置向前兼容。** 启动时把当前版本的全部字段与旧 `config.toml` 比对，只**追加**缺失项（默认值），用户改过的值和手写注释原样保留——以后加配置项不用手动补。
+12. **弹幕 cid 自动回填。** 从热门/搜索/收藏进入视频时只带 bvid，播放解析出的第一条分P cid 会写回曲目（多分P 切 P 也会更新），弹幕与播放上报都不再依赖手动指定 cid。
+13. **纯 Rust 运行时。** 除 mpv/libmpv 与可选 ffmpeg，HTTP/TLS/JSON/SQLite 全部编进二进制：`reqwest`+`rustls`（不依赖系统 OpenSSL）、`serde_json`、`rusqlite`（bundled）。交叉编译只需处理 `ring` 那一点汇编。
 
 ## 依赖
 
@@ -75,6 +88,7 @@ cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus）：视频、�
 |---|---|---|
 | `libmpv.so` 或 `mpv` 可执行文件 | **至少一个** | 播放内核 |
 | `ffmpeg` | 可选 | 下载转封装/转码/写元数据；缺失则保存原始 `m4a`/`opus` |
+| — | 内置 | 弹幕/WS 全用纯 Rust crate：`tungstenite`(rustls) + `flate2` + `brotli`，无额外系统库 |
 | Rust ≥ 1.78 | 仅构建 | `cargo build --release` |
 
 后端配置：`auto`（默认，先 libmpv 后 mpv）/ `lib` / `proc`。
@@ -189,7 +203,10 @@ bmus livetest <room> --secs 15                    # 逐档实测直播音频码�
 | `c` / `C` | 收藏 / 取消收藏（默认收藏夹） | — |
 | `v` | 点赞 | — |
 | `Esc` | 返回上一层浏览 | — |
-| `1`–`7` / `Tab` | 搜索/热门/收藏/直播/队列/UP·合集/动态 | 视图切换 |
+| `1`–`8` / `Tab` | 搜索/热门/收藏/直播/队列/UP·合集/动态/弹幕 | 视图切换 |
+| `8` / `t` | 直接打开弹幕视图（默认自动跟屏） | — |
+| `f` / 点右下角按钮（鼠标可点） | 开关「自动跟屏」：关掉后 `j/k` 翻历史不会跳回最新 | — |
+| `Enter`（弹幕视图） | 跳到该条弹幕的时间点（视频） | — |
 | `/` `:` `r` `?` `q` | 搜索 / 命令行 / 刷新 / 帮助 / 退出 | `/` `:` |
 
 命令行示例：
@@ -208,6 +225,16 @@ bmus livetest <room> --secs 15                    # 逐档实测直播音频码�
 :login / :logout
 :vol 80   :clear   :q
 ```
+
+弹幕相关命令：
+
+```
+:say <文本>      给当前视频（当前分P的当前时间点）/ 当前直播间发弹幕
+                 需 config 里 allow_send = true；会弹确认框，y 发送 n 取消
+:rank            当前直播间高能榜（前 10 + 自己的名次，只读）
+```
+
+发送侧保护：每条手动确认、最小间隔 8 秒、每小时 ≤30 条、失败不自动重试；撞到 `412/-799` 直接停并提示。高能榜按互动/消费计分，只听音频不会上榜。
 
 列表前缀：`♪` 视频、`◉` 直播、`▤` 收藏夹、`▣` 合集、`☰` 播放列表、`◍` UP 主。
 
@@ -230,6 +257,7 @@ download_dir = "~/Music/bili_rec"      # 实际落在 <up主>/ 下
 filename_template = "[%(upload_date)s]%(title).150B [%(id)s].%(ext)s"
 ffmpeg_path = "ffmpeg"
 max_bitrate = 192
+allow_send = true      # :say 发弹幕开关（默认开；仍受手动确认 + 8s/30条限频保护）
 ```
 
 模板字段：`%(upload_date)s`、`%(title)s`、`%(title).150B`（按**字节**截断，中文 3 字节/字）、`%(id)s`、`%(ext)s`。渲染后做文件名净化（`/ \ : * ? " < > |` 与控制字符 → `_`），整段名字超 240 字节在扩展名前截断，避免撞 `NAME_MAX=255`。
@@ -248,7 +276,12 @@ downloads(id, uid, bvid, page, title, path, pubdate, ts)  -- 去重依据 pubdat
 - 未登录：搜索可用，但 `space/wbi/arc/search` 会 412；动态与直播关注列表必须登录。
 - 同 IP 高频请求会触发 `-799/-412`，程序会退避重试，仍失败需等待或换网络。
 - 点赞只支持"赞"，无取消赞；收藏固定写入默认收藏夹。
-- 不支持弹幕、评论、投币、下载视频画面。
+- 弹幕只做「显示 + 发一条」，不支持样式/屏蔽词管理、不支持批量或自动回复。
+- 发弹幕受服务端规则限制：部分直播间要求关注/粉丝牌等级/手机号，超频会被禁言；程序只能保证自身限频，不能绕过平台限制。
+- 播放上报只发真实进度；刻意循环空播刷播放属于违规，不在实现范围。
+- 高能榜必须登录，且只读；上榜靠消费，与是否用 bmus 无关；房间离线时返回 `-400`。
+- 卡顿自愈按「位置不动」判断，直播正常但弹幕/画面仍走流时不会误判；若上游长时间无数据，会按 20 秒冷却反复重连。
+- 不支持评论、投币、下载视频画面。
 - 只发布 Linux 与 Windows 预编译产物；macOS 需自行构建（缺 Apple SDK）。
 
 ## 许可证
@@ -256,4 +289,5 @@ downloads(id, uid, bvid, page, title, path, pubdate, ts)  -- 去重依据 pubdat
 本项目采用 [WTFPL v2](LICENSE)（Do What The Fuck You Want To Public License）：想怎么用就怎么用——复制、修改、发布、使用、编译、销售、分发，商业或非商业用途皆可，无需署名、无需开源。
 
 第三方 Rust 依赖均为宽松协议（MIT / Apache-2.0 / BSD / ISC / Zlib / Unicode-3.0 / MPL-2.0 等），无 GPL/AGPL；分发二进制时应一并附带其许可证声明。mpv / ffmpeg 仅作为外部程序或运行时动态库调用，未随本项目分发。
-#（注：内容由AI生成）
+
+新增的弹幕/压缩依赖（`tungstenite`、`flate2`、`brotli` 及其传递依赖）同样为 MIT / Apache-2.0 / BSD / Zlib 等宽松协议，未引入 GPL/AGPL。
