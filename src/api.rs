@@ -64,12 +64,16 @@ pub struct DynItem {
     pub author: String,
     pub mid: i64,
     pub time: String,
+    /// 列表用的短文本
     pub text: String,
+    /// 详情用的完整正文（含转发原文/文章描述）
+    pub body: String,
     pub kind: String,
     pub title: String,
     pub bvid: Option<String>,
     pub aid: i64,
     pub images: usize,
+    pub image_urls: Vec<String>,
     pub like: i64,
     pub comment: i64,
     pub liked: bool,
@@ -1664,14 +1668,15 @@ impl Api {
             .collect())
     }
 
-    /// 关注动态的全部类型（视频 / 图文 / 转发 / 文章 / 直播等）
-    pub fn dynamic_items(&self, page: u32) -> Result<Vec<DynItem>> {
+    /// 关注动态的全部类型。返回（条目, 下一页 offset, 是否还有更多）。
+    /// B 站这个接口的 `page` 参数无效，翻页必须用上一次响应的 `offset`。
+    pub fn dynamic_items(&self, offset: &str) -> Result<(Vec<DynItem>, String, bool)> {
         let url = format!(
-            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=all&page={}&offset=",
-            page
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=all&page=1&offset={}",
+            offset
         );
         let d = self.data(&url, REF_VIDEO)?;
-        Ok(d["items"]
+        let items = d["items"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -1682,22 +1687,28 @@ impl Api {
                 let dy = &m["module_dynamic"];
                 let major = &dy["major"];
                 let id = it["id_str"].as_str().unwrap_or("").to_string();
+                let text = strip_html(dy["desc"]["text"].as_str().unwrap_or(""));
+                // basic 里直接给了评论区的 type/oid，比按卡片类型猜更可靠
+                let btype = it["basic"]["comment_type"].as_i64().unwrap_or(0) as i32;
+                let boid = it["basic"]["comment_id_str"].as_str().unwrap_or("").to_string();
                 let mut item = DynItem {
                     id,
                     author: strip_html(author["name"].as_str().unwrap_or("")),
                     mid: author["mid"].as_i64().unwrap_or(0),
                     time: author["pub_time"].as_str().unwrap_or("").to_string(),
-                    text: strip_html(dy["desc"]["text"].as_str().unwrap_or("")),
+                    text: text.clone(),
+                    body: text,
                     kind: "动态".into(),
                     title: String::new(),
                     bvid: None,
                     aid: 0,
                     images: 0,
+                    image_urls: Vec::new(),
                     like: m["module_stat"]["like"]["count"].as_i64().unwrap_or(0),
                     comment: m["module_stat"]["comment"]["count"].as_i64().unwrap_or(0),
                     liked: m["module_stat"]["like"]["status"].as_bool().unwrap_or(false),
-                    ctype: 17,
-                    oid: it["id_str"].as_str().unwrap_or("").to_string(),
+                    ctype: if btype > 0 { btype } else { 17 },
+                    oid: if boid.is_empty() { it["id_str"].as_str().unwrap_or("").to_string() } else { boid },
                 };
                 if major["archive"].is_object() {
                     let a = &major["archive"];
@@ -1705,44 +1716,65 @@ impl Api {
                     item.title = strip_html(a["title"].as_str().unwrap_or(""));
                     item.bvid = a["bvid"].as_str().map(str::to_string);
                     item.aid = a["aid"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    if item.aid > 0 {
-                        item.ctype = 1;
-                        item.oid = item.aid.to_string();
-                    }
                 } else if major["draw"].is_object() {
                     item.kind = "图文".into();
-                    item.images = major["draw"]["items"].as_array().map(|a| a.len()).unwrap_or(0);
-                    if let Some(aid) = major["draw"]["id"].as_str() {
-                        item.ctype = 11;
-                        item.oid = aid.to_string();
+                    let arr = major["draw"]["items"].as_array().cloned().unwrap_or_default();
+                    item.images = arr.len();
+                    item.image_urls = arr
+                        .iter()
+                        .filter_map(|p| p["src"].as_str().map(str::to_string))
+                        .collect();
+                    if item.body.is_empty() {
+                        item.body = format!("[图片 x{}]", item.images);
                     }
                     if item.text.is_empty() {
-                        item.title = format!("图片 x{}", item.images);
+                        item.text = format!("[图片 x{}]", item.images);
                     }
                 } else if major["article"].is_object() {
                     let a = &major["article"];
                     item.kind = "文章".into();
                     item.title = strip_html(a["title"].as_str().unwrap_or(""));
-                    if let Some(id) = a["id"].as_str() {
-                        item.ctype = 12;
-                        item.oid = id.to_string();
+                    let desc = strip_html(a["desc"].as_str().unwrap_or(""));
+                    if !desc.is_empty() {
+                        item.body = if item.body.is_empty() { desc } else { format!("{}\n{}", item.body, desc) };
                     }
                 } else if major["live_rcmd"].is_object() {
                     item.kind = "直播".into();
                     if let Ok(v) = serde_json::from_str::<Value>(major["live_rcmd"]["content"].as_str().unwrap_or("")) {
                         item.title = strip_html(v["live_play_info"]["title"].as_str().unwrap_or(""));
                     }
+                } else if major["opus"].is_object() {
+                    let o = &major["opus"];
+                    item.kind = "图文".into();
+                    item.title = strip_html(o["title"].as_str().unwrap_or(""));
+                    let desc = strip_html(
+                        o["summary"].as_str().or_else(|| o["desc"].as_str()).unwrap_or(""),
+                    );
+                    if !desc.is_empty() {
+                        item.body = if item.body.is_empty() { desc } else { format!("{}\n{}", item.body, desc) };
+                    }
                 } else if major["orig"].is_object() {
                     item.kind = "转发".into();
                     if let Some(s) = major["orig"]["dynamic"].as_str() {
                         if let Ok(v) = serde_json::from_str::<Value>(s) {
-                            item.title = strip_html(v["desc"]["text"].as_str().unwrap_or(""));
+                            let orig = strip_html(v["desc"]["text"].as_str().unwrap_or(""));
+                            if !orig.is_empty() {
+                                item.title = orig.clone();
+                                item.body = if item.body.is_empty() {
+                                    format!("↪ {}", orig)
+                                } else {
+                                    format!("{}\n↪ {}", item.body, orig)
+                                };
+                            }
                         }
                     }
                 }
                 Some(item)
             })
-            .collect())
+            .collect();
+        let next = d["offset"].as_str().unwrap_or("").to_string();
+        let has_more = d["has_more"].as_bool().unwrap_or(false) && !next.is_empty();
+        Ok((items, next, has_more))
     }
 
     /// 评论区列表；返回（评论, 是否还有下一页）

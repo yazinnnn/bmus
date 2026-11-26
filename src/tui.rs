@@ -81,7 +81,7 @@ pub enum Job {
     /// 直播间高能榜（只读）
     Rank { room: i64 },
     /// 动态全类型 feed
-    DynamicAll { page: u32 },
+    DynamicAll { offset: String },
     /// 评论列表（root=Some 表示拉某条评论的回复）
     Comments { ctype: i32, oid: String, page: u32, ctx: CommentCtx, root: Option<i64> },
     /// 发评论（确认后）
@@ -103,7 +103,7 @@ pub enum JobOut {
     Note(String),
     /// 弹幕发送成功：立即本地回显，不必等接口缓存刷新
     DmSent { text: String, at: f64, label: String },
-    DynamicAll { items: Vec<DynItem>, err: Option<String> },
+    DynamicAll { items: Vec<DynItem>, lives: Vec<Track>, next_offset: String, has_more: bool, err: Option<String> },
     Comments { items: Vec<Comment>, has_more: bool, ctx: CommentCtx, root: Option<i64>, err: Option<String> },
     Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
@@ -280,10 +280,19 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                 };
                 let _ = tx.send(out);
             }
-            Job::DynamicAll { page } => {
-                let out = match api.dynamic_items(page) {
-                    Ok(items) => JobOut::DynamicAll { items, err: None },
-                    Err(e) => JobOut::DynamicAll { items: vec![], err: Some(format!("{}", e)) },
+            Job::DynamicAll { offset } => {
+                let first = offset.is_empty();
+                let (r, lives) = match api.dynamic_items(&offset) {
+                    Ok(r) => (Ok(r), if first { api.dynamic_lives_dbg().unwrap_or_default().0 } else { vec![] }),
+                    Err(e) => (Err(e), vec![]),
+                };
+                let out = match r {
+                    Ok((items, next_offset, has_more)) => JobOut::DynamicAll {
+                        items, lives, next_offset, has_more, err: None,
+                    },
+                    Err(e) => JobOut::DynamicAll {
+                        items: vec![], lives, next_offset: offset, has_more: false, err: Some(format!("{}", e)),
+                    },
                 };
                 let _ = tx.send(out);
             }
@@ -542,6 +551,12 @@ pub struct App {
     cmt_pending: Option<(String, String)>,
     /// 待确认的点赞：(目标描述, 目标)
     like_pending: Option<(String, LikeTarget)>,
+    /// 动态翻页游标
+    dyn_offset: String,
+    /// 首页拉到的关注直播间数量
+    dyn_live_count: usize,
+    /// 评论页顶部展示的动态详情（从动态进入评论时）
+    cmt_dyn: Option<DynItem>,
 }
 
 struct Report {
@@ -625,6 +640,9 @@ impl App {
             cmt_has_more: false,
             cmt_pending: None,
             like_pending: None,
+            dyn_offset: String::new(),
+            dyn_live_count: 0,
+            cmt_dyn: None,
         };
         app.load_popular();
         app.load_fav();
@@ -1069,6 +1087,7 @@ impl App {
         self.cmt_parent = None;
         self.cmt_page = 1;
         self.cmt_has_more = false;
+        self.cmt_dyn = None;
         self.status = format!("加载评论：{}", ctx.label);
         let _ = self.job_tx.send(Job::Comments {
             ctype: ctx.ctype,
@@ -1135,6 +1154,7 @@ impl App {
             oid: d.oid.clone(),
             label: format!("{} {} · {}", d.kind, d.author, fit(&d.text, 20)),
         });
+        self.cmt_dyn = Some(d.clone());
     }
 
     fn load_comments_page(&mut self) {
@@ -1201,6 +1221,25 @@ impl App {
             ctx,
             root: None,
         });
+    }
+
+    /// 对选中的评论发起回复：进入输入模式，回车后走 :cmt 确认框
+    fn start_reply(&mut self) {
+        if self.cmt_ctx.is_none() {
+            self.status = "先进入评论区".into();
+            return;
+        }
+        let c = match self.selected_entry() {
+            Some(Entry::Comment(c)) => c,
+            _ => {
+                self.status = "选中一条评论后按 R 回复".into();
+                return;
+            }
+        };
+        self.cmt_root = Some(c.rpid);
+        self.cmt_parent = Some(c.rpid);
+        self.input = Some((":cmt ".into(), String::new()));
+        self.status = format!("回复 @{}（输入内容后回车，再确认发送）", c.user);
     }
 
     fn cmd_cmt(&mut self, arg: &str) {
@@ -1777,24 +1816,35 @@ impl App {
                     }
                     self.status = format!("已发送 → {}｜{}", label, text);
                 }
-                JobOut::DynamicAll { items, err } => {
+                JobOut::DynamicAll { items, lives, next_offset, has_more, err } => {
+                    let first = self.dyn_offset.is_empty();
+                    self.dyn_offset = next_offset;
                     let v = &mut self.views[6];
                     v.pending_page = 0;
-                    if items.is_empty() && err.is_none() && v.page > 1 {
+                    if let Some(e) = err {
+                        v.has_more = false;
+                        self.status = format!("动态加载失败: {}", e);
+                        return;
+                    }
+                    let live_n = lives.len();
+                    if first {
+                        self.dyn_live_count = live_n;
+                        // 关注 UP 里正在直播的房间放最前
+                        v.items.clear();
+                        v.sel = 0;
+                        v.offset = 0;
+                        v.items.extend(lives.into_iter().map(Entry::Track));
+                    }
+                    if items.is_empty() {
                         v.has_more = false;
                         self.status = format!("动态已到尾页（共 {} 条）", v.items.len());
                     } else {
-                        if v.page == 1 {
-                            v.items.clear();
-                            v.sel = 0;
-                            v.offset = 0;
-                        }
                         v.items.extend(items.into_iter().map(Entry::Dyn));
-                        v.has_more = !err.is_some();
-                        self.status = match err {
-                            Some(e) => format!("动态加载失败: {}", e),
-                            None => format!("动态 {} 条（含全部类型）", v.items.len()),
-                        };
+                        v.has_more = has_more;
+                        self.status = format!(
+                            "动态 {} 条 · 直播中 {} 个（> 下一页）",
+                            v.items.len(), self.dyn_live_count
+                        );
                     }
                 }
                 JobOut::Comments { items, has_more, ctx, root, err } => {
@@ -1936,7 +1986,8 @@ impl App {
         v.has_more = true;
         v.pending_page = 0;
         self.status = "加载动态（全部类型）…".into();
-        let _ = self.job_tx.send(Job::DynamicAll { page: 1 });
+        self.dyn_offset.clear();
+        let _ = self.job_tx.send(Job::DynamicAll { offset: String::new() });
     }
 
     /// 当前视图翻页（>, <）
@@ -1962,7 +2013,8 @@ impl App {
             v.pending_page = next;
             v.page = next;
             self.status = format!("加载动态第 {} 页…", next);
-            let _ = self.job_tx.send(Job::DynamicAll { page: next });
+            let offset = self.dyn_offset.clone();
+            let _ = self.job_tx.send(Job::DynamicAll { offset });
             return;
         }
         if matches!(kind, ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku) {
@@ -2207,6 +2259,7 @@ impl App {
             "dynamic" | "feed" | "dyn" => self.load_dynamic(),
             "comments" | "comment" if arg.is_empty() => self.open_current_comments(),
             "cmt" | "comment" | "comments" => self.cmd_cmt(arg),
+            "reply" => self.start_reply(),
             "say" => self.cmd_say(arg),
             "rank" | "gold" => self.show_rank(),
             "like" => self.act_like(true),
@@ -2332,10 +2385,15 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let text = buf.trim().to_string();
-                    let is_cmd = self.input.as_ref().map(|(l, _)| l.starts_with(':')).unwrap_or(false);
+                    let label = self.input.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
+                    let is_cmd = label.starts_with(':');
                     self.input = None;
                     if is_cmd {
-                        self.run_command(&text);
+                        if label.starts_with(":cmt ") {
+                            self.cmd_cmt(&text);
+                        } else {
+                            self.run_command(&text);
+                        }
                     } else if !text.is_empty() {
                         self.do_search(&text);
                     }
@@ -2526,9 +2584,13 @@ impl App {
             }
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('R') => {
-                self.repeat = self.repeat.next();
-                self.player.set_loop(self.repeat == Repeat::One);
-                self.status = format!("播放模式：{}（作用于当前视图）", self.repeat.label());
+                if self.views[self.view_idx].kind == ViewKind::Comment {
+                    self.start_reply();
+                } else {
+                    self.repeat = self.repeat.next();
+                    self.player.set_loop(self.repeat == Repeat::One);
+                    self.status = format!("播放模式：{}（作用于当前视图）", self.repeat.label());
+                }
             }
             KeyCode::Char('L') => {
                 let live = self
@@ -2804,8 +2866,37 @@ impl App {
             self.draw_danmaku(f, cols[1]);
             return;
         }
+        // 评论视图里，如果来源是某条动态，上方固定显示动态正文
+        let dyn_detail = if self.views[self.view_idx].kind == ViewKind::Comment {
+            self.cmt_dyn.clone()
+        } else {
+            None
+        };
+        let list_area = if let Some(d) = dyn_detail {
+            let detail_w = cols[1].width.saturating_sub(4) as usize;
+            let dl = dyn_detail_lines(&d, detail_w);
+            let h = (dl.len() + 2)
+                .min(cols[1].height.saturating_sub(6) as usize)
+                .max(3) as u16;
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(h), Constraint::Min(4)])
+                .split(cols[1]);
+            f.render_widget(
+                Paragraph::new(dl).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(Span::styled(" 动态正文 ", Style::default().fg(Color::Cyan))),
+                ),
+                parts[0],
+            );
+            parts[1]
+        } else {
+            cols[1]
+        };
         let v = &mut self.views[self.view_idx];
-        let inner_h = cols[1].height.saturating_sub(2) as usize;
+        let inner_h = list_area.height.saturating_sub(2) as usize;
         if v.sel < v.offset {
             v.offset = v.sel;
         }
@@ -2823,7 +2914,7 @@ impl App {
             format!(" {}{} ({}) · {} ", v.name, depth, v.items.len(), v.hint)
         };
 
-        let width = cols[1].width.saturating_sub(4) as usize;
+        let width = list_area.width.saturating_sub(4) as usize;
         let mut lines: Vec<Line> = Vec::new();
         if v.items.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -2863,7 +2954,7 @@ impl App {
                     .border_style(Style::default().fg(Color::DarkGray))
                     .title(Span::styled(title, Style::default().fg(Color::Gray))),
             ),
-            cols[1],
+            list_area,
         );
     }
 
@@ -3174,6 +3265,75 @@ fn keep_playable(items: Vec<Entry>) -> Vec<Entry> {
             _ => true,
         })
         .collect()
+}
+
+/// 动态详情块：正文 + 图片提示 + 统计
+fn dyn_detail_lines(d: &DynItem, width: usize) -> Vec<Line<'_>> {
+    let mut out = Vec::new();
+    let head = format!("[{}] {} · {}", d.kind, d.author, d.time);
+    out.push(Line::from(Span::styled(
+        fit(&head, width),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    if !d.title.is_empty() {
+        for l in wrap_lines(&d.title, width) {
+            out.push(Line::from(Span::styled(
+                l,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    for para in d.body.split('\n') {
+        if para.is_empty() {
+            continue;
+        }
+        for l in wrap_lines(para, width) {
+            out.push(Line::from(Span::styled(fit(&l, width), Style::default().fg(Color::Gray))));
+        }
+    }
+    if d.images > 0 {
+        let hint = if d.image_urls.is_empty() {
+            format!("🖼 图片 {} 张（接口未返回缩略图链接）", d.images)
+        } else {
+            format!("🖼 图片 {} 张 · {}", d.images, fit(&d.image_urls[0], width.saturating_sub(14)))
+        };
+        out.push(Line::from(Span::styled(
+            fit(&hint, width),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let stat = format!(
+        "♥ {} · 💬 {} · uid {} · 动态 {}",
+        d.like, d.comment, d.mid, d.id
+    );
+    out.push(Line::from(Span::styled(
+        fit(&stat, width),
+        Style::default().fg(Color::DarkGray),
+    )));
+    out
+}
+
+/// 按显示宽度折行（中文按 2 列计）
+fn wrap_lines(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(1);
+        if used + w > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        cur.push(c);
+        used += w;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn fit(s: &str, width: usize) -> String {
