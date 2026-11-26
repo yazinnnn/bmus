@@ -65,6 +65,9 @@ cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus）：视频、�
 | 视频播放上报 | `POST /x/click-interface/web/heartbeat` |
 | 直播进房上报 | `POST /xlive/web-room/v1/index/roomEntryAction` |
 | 直播间高能榜 | `/xlive/general-interface/v1/rank/queryContributionRank` |
+| 评论列表 / 回复 | `/x/v2/reply?type=&oid=&pn=`、`/x/v2/reply/reply?type=&oid=&root=` |
+| 发评论 / 点赞评论 | `POST /x/v2/reply/add`、`POST /x/v2/reply/action` |
+| 点赞动态 | `POST /x/dynamic/feed/dyn/thumb`（JSON body + csrf） |
 
 ## 实现思路
 
@@ -80,7 +83,8 @@ cmus 风格的 bilibili 终端播放器（bmus = bilibili + cmus）：视频、�
 10. **卡顿自愈。** 播放中位置连续 12 秒不动（暂停/结束不算）即判卡顿：先切备用 CDN，URL 用完就重新解析播放地址；20 秒冷却避免死循环，恢复时不重建弹幕线程与上报状态。
 11. **配置向前兼容。** 启动时把当前版本的全部字段与旧 `config.toml` 比对，只**追加**缺失项（默认值），用户改过的值和手写注释原样保留——以后加配置项不用手动补。
 12. **弹幕 cid 自动回填。** 从热门/搜索/收藏进入视频时只带 bvid，播放解析出的第一条分P cid 会写回曲目（多分P 切 P 也会更新），弹幕与播放上报都不再依赖手动指定 cid。
-13. **纯 Rust 运行时。** 除 mpv/libmpv 与可选 ffmpeg，HTTP/TLS/JSON/SQLite 全部编进二进制：`reqwest`+`rustls`（不依赖系统 OpenSSL）、`serde_json`、`rusqlite`（bundled）。交叉编译只需处理 `ring` 那一点汇编。
+13. **全类型动态与评论。** 动态视图用 `feed/all?type=all` 展示视频/图文/转发/文章/直播；评论区按对象选 type：视频=1(aid)、图片动态=11(相簿 id)、文章=12(cvid)、文字/转发动态=17(动态 id)。发评论/点赞都走 `allow_send` 开关 + 手动确认 + 8 秒/30 次限频。
+14. **纯 Rust 运行时。** 除 mpv/libmpv 与可选 ffmpeg，HTTP/TLS/JSON/SQLite 全部编进二进制：`reqwest`+`rustls`（不依赖系统 OpenSSL）、`serde_json`、`rusqlite`（bundled）。交叉编译只需处理 `ring` 那一点汇编。
 
 ## 依赖
 
@@ -203,10 +207,16 @@ bmus livetest <room> --secs 15                    # 逐档实测直播音频码�
 | `c` / `C` | 收藏 / 取消收藏（默认收藏夹） | — |
 | `v` | 点赞 | — |
 | `Esc` | 返回上一层浏览 | — |
-| `1`–`8` / `Tab` | 搜索/热门/收藏/直播/队列/UP·合集/动态/弹幕 | 视图切换 |
+| `1`–`9` / `Tab` | 搜索/热门/收藏/直播/队列/UP·合集/动态/弹幕/评论 | 视图切换 |
 | `8` / `t` | 直接打开弹幕视图（默认自动跟屏） | — |
 | `f` / 点右下角按钮（鼠标可点） | 开关「自动跟屏」：关掉后 `j/k` 翻历史不会跳回最新 | — |
 | `Enter`（弹幕视图） | 跳到该条弹幕的时间点（视频） | — |
+| `7` / `:dyn` | 动态视图，显示全类型（视频/图文/转发/文章/直播） | — |
+| `Enter`（动态视图） | 视频动态→播放；其他动态→打开该动态评论 | — |
+| `c`（动态视图） | 打开选中动态的评论 | — |
+| `9` / `:comments` | 打开当前播放视频的评论区 | — |
+| `Enter`（评论视图） | 展开该评论的回复 | — |
+| `Esc`（评论视图） | 从回复返回主评论 | — |
 | `/` `:` `r` `?` `q` | 搜索 / 命令行 / 刷新 / 帮助 / 退出 | `/` `:` |
 
 命令行示例：
@@ -224,7 +234,12 @@ bmus livetest <room> --secs 15                    # 逐档实测直播音频码�
 :dl / :star / :unstar / :like
 :login / :logout
 :vol 80   :clear   :q
+:comments            打开当前视频的评论区
+:cmt <文本>          在当前评论区发表评论（确认后发送）
+:dyn                 重新拉取全类型动态
 ```
+
+写操作保护：`:say` 弹幕、`:cmt` 评论、`v` 点赞统一受 `allow_send` 开关控制，均需 `y` 手动确认，共用 8 秒间隔 + 每小时 30 次限频。
 
 弹幕相关命令：
 
@@ -257,7 +272,7 @@ download_dir = "~/Music/bili_rec"      # 实际落在 <up主>/ 下
 filename_template = "[%(upload_date)s]%(title).150B [%(id)s].%(ext)s"
 ffmpeg_path = "ffmpeg"
 max_bitrate = 192
-allow_send = true      # :say 发弹幕开关（默认开；仍受手动确认 + 8s/30条限频保护）
+allow_send = true      # :say/:cmt/点赞总开关（默认开；仍受手动确认 + 8s/30次限频保护）
 ```
 
 模板字段：`%(upload_date)s`、`%(title)s`、`%(title).150B`（按**字节**截断，中文 3 字节/字）、`%(id)s`、`%(ext)s`。渲染后做文件名净化（`/ \ : * ? " < > |` 与控制字符 → `_`），整段名字超 240 字节在扩展名前截断，避免撞 `NAME_MAX=255`。
@@ -281,7 +296,9 @@ downloads(id, uid, bvid, page, title, path, pubdate, ts)  -- 去重依据 pubdat
 - 播放上报只发真实进度；刻意循环空播刷播放属于违规，不在实现范围。
 - 高能榜必须登录，且只读；上榜靠消费，与是否用 bmus 无关；房间离线时返回 `-400`。
 - 卡顿自愈按「位置不动」判断，直播正常但弹幕/画面仍走流时不会误判；若上游长时间无数据，会按 20 秒冷却反复重连。
-- 不支持评论、投币、下载视频画面。
+- 评论只做「顶层 + 回复」的读取与发表/点赞；不支持表情面板、评论图片上传、删除/举报评论。
+- 发评论/点赞受 B 站侧风控：部分内容需验证码或等级限制，程序只保证自身限频。
+- 不支持投币、下载视频画面。
 - 只发布 Linux 与 Windows 预编译产物；macOS 需自行构建（缺 Apple SDK）。
 
 ## 许可证

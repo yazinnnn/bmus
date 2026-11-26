@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
-use crate::api::{fmt_time, Api, Source, Track};
+use crate::api::{fmt_time, Api, Comment, DynItem, Source, Track};
 use crate::danmaku::{DmEvent, DmKind, DmLine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,12 +57,20 @@ pub enum SayTarget {
     Live { room: i64 },
 }
 
+#[derive(Clone)]
+enum LikeTarget {
+    Video(i64),
+    Dyn(String),
+    Comment { rpid: i64, ctx: CommentCtx },
+}
+
 /// 后台任务：网络请求全部放到 worker 线程，避免卡住 UI
 pub enum Job {
     Cfg(crate::config::Config),
     Search { kind: String, kw: String, page: u32, target: usize },
     More { kind: ViewKind, page: u32, kw: String, sid: i64, skind: u8, smid: i64 },
     Play { track: Track, low: bool, live_low: bool },
+    #[allow(dead_code)]
     Dynamic,
     /// 直播进房（计入观看 + 直播历史）
     LiveEntry { room: i64 },
@@ -72,6 +80,16 @@ pub enum Job {
     Say { text: String, target: SayTarget },
     /// 直播间高能榜（只读）
     Rank { room: i64 },
+    /// 动态全类型 feed
+    DynamicAll { page: u32 },
+    /// 评论列表（root=Some 表示拉某条评论的回复）
+    Comments { ctype: i32, oid: String, page: u32, ctx: CommentCtx, root: Option<i64> },
+    /// 发评论（确认后）
+    CommentAdd { text: String, ctx: CommentCtx, root: i64, parent: i64, label: String },
+    /// 点赞评论（确认后）
+    CommentLike { rpid: i64, on: bool, ctx: CommentCtx, label: String },
+    /// 点赞动态（确认后）
+    DynLike { id: String, on: bool, label: String },
 }
 
 pub enum JobOut {
@@ -79,9 +97,14 @@ pub enum JobOut {
     Search { target: usize, kw: String, items: Vec<Track>, err: Option<String> },
     More { page: u32, items: Vec<Track>, err: Option<String> },
     Play { track: Track, urls: Vec<String>, label: String, err: Option<String> },
+    #[allow(dead_code)]
     Dynamic { lives: Vec<Track>, videos: Vec<Track>, err: Option<String>, log: Vec<String> },
     /// 通用提示（发送结果 / 进房失败等）
     Note(String),
+    /// 弹幕发送成功：立即本地回显，不必等接口缓存刷新
+    DmSent { text: String, at: f64, label: String },
+    DynamicAll { items: Vec<DynItem>, err: Option<String> },
+    Comments { items: Vec<Comment>, has_more: bool, ctx: CommentCtx, root: Option<i64>, err: Option<String> },
     Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
 
@@ -143,7 +166,7 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                             }
                         },
                         ViewKind::Dynamic => api.dynamic_videos(page)?,
-                        ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku => anyhow::bail!("该视图不支持翻页"),
+                        ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku | ViewKind::Comment => anyhow::bail!("该视图不支持翻页"),
                     })
                 })();
                 let mut r = r;
@@ -234,14 +257,21 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                 let _ = api.video_heartbeat(aid, cid, pos);
             }
             Job::Say { text, target } => {
-                let r = match target {
-                    SayTarget::Video { cid, bvid, progress } => api.video_send(cid, &bvid, progress, &text),
-                    SayTarget::Live { room } => api.live_send(room, &text),
-                };
-                let _ = tx.send(JobOut::Note(match r {
-                    Ok(m) => m,
-                    Err(e) => format!("{}", e),
-                }));
+                match target {
+                    SayTarget::Video { cid, bvid, progress } => match api.video_send(cid, &bvid, progress, &text) {
+                        Ok(m) => {
+                            let _ = tx.send(JobOut::DmSent { text, at: progress as f64, label: m });
+                        }
+                        Err(e) => { let _ = tx.send(JobOut::Note(format!("{}", e))); }
+                    },
+                    SayTarget::Live { room } => {
+                        let r = api.live_send(room, &text);
+                        let _ = tx.send(JobOut::Note(match r {
+                            Ok(m) => m,
+                            Err(e) => format!("{}", e),
+                        }));
+                    }
+                }
             }
             Job::Rank { room } => {
                 let out = match api.live_gold_rank(room) {
@@ -249,6 +279,47 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                     Err(e) => JobOut::Note(format!("高能榜: {}", e)),
                 };
                 let _ = tx.send(out);
+            }
+            Job::DynamicAll { page } => {
+                let out = match api.dynamic_items(page) {
+                    Ok(items) => JobOut::DynamicAll { items, err: None },
+                    Err(e) => JobOut::DynamicAll { items: vec![], err: Some(format!("{}", e)) },
+                };
+                let _ = tx.send(out);
+            }
+            Job::Comments { ctype, oid, page, ctx, root } => {
+                let out = match root {
+                    Some(r) => match api.comment_replies(ctype, &oid, r, page) {
+                        Ok(items) => JobOut::Comments { items, has_more: false, ctx, root, err: None },
+                        Err(e) => JobOut::Comments { items: vec![], has_more: false, ctx, root, err: Some(format!("{}", e)) },
+                    },
+                    None => match api.comments(ctype, &oid, page) {
+                        Ok((items, has_more)) => JobOut::Comments { items, has_more, ctx, root, err: None },
+                        Err(e) => JobOut::Comments { items: vec![], has_more: false, ctx, root, err: Some(format!("{}", e)) },
+                    },
+                };
+                let _ = tx.send(out);
+            }
+            Job::CommentAdd { text, ctx, root, parent, label } => {
+                let r = api.comment_add(ctx.ctype, &ctx.oid, &text, root, parent);
+                let _ = tx.send(JobOut::Note(match r {
+                    Ok(m) => format!("{} → {}", label, m),
+                    Err(e) => format!("{}", e),
+                }));
+            }
+            Job::CommentLike { rpid, on, ctx, label } => {
+                let r = api.comment_like(ctx.ctype, &ctx.oid, rpid, on);
+                let _ = tx.send(JobOut::Note(match r {
+                    Ok(()) => if on { format!("已点赞评论 · {}", label) } else { format!("已取消点赞 · {}", label) },
+                    Err(e) => format!("{}", e),
+                }));
+            }
+            Job::DynLike { id, on, label } => {
+                let r = api.dynamic_like(&id, on);
+                let _ = tx.send(JobOut::Note(match r {
+                    Ok(()) => if on { format!("已点赞动态 · {}", label) } else { format!("已取消点赞 · {}", label) },
+                    Err(e) => format!("{}", e),
+                }));
             }
         }
     }
@@ -264,6 +335,7 @@ pub enum ViewKind {
     Space,
     Dynamic,
     Danmaku,
+    Comment,
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +345,8 @@ pub enum Entry {
     Season { mid: i64, season_id: i64, title: String, count: u64 },
     Series { mid: i64, series_id: i64, title: String, count: u64 },
     Up { mid: i64, name: String },
+    Dyn(DynItem),
+    Comment(Comment),
 }
 
 impl Entry {
@@ -283,6 +357,11 @@ impl Entry {
             Entry::Season { title, .. } => title.clone(),
             Entry::Series { title, .. } => format!("[播放列表] {}", title),
             Entry::Up { name, .. } => name.clone(),
+            Entry::Dyn(d) => {
+                let head = if d.text.is_empty() { d.title.clone() } else { d.text.clone() };
+                format!("[{}] {} · {}", d.kind, d.author, head)
+            }
+            Entry::Comment(c) => format!("{}：{}", c.user, c.text),
         }
     }
 
@@ -294,6 +373,15 @@ impl Entry {
             Entry::Season { .. } => "▣",
             Entry::Series { .. } => "☰",
             Entry::Up { .. } => "◍",
+            Entry::Dyn(d) => match d.kind.as_str() {
+                "视频" => "♪",
+                "图文" => "▣",
+                "文章" => "▤",
+                "直播" => "◉",
+                "转发" => "↪",
+                _ => "◍",
+            },
+            Entry::Comment(_) => "•",
         }
     }
 
@@ -304,6 +392,28 @@ impl Entry {
             Entry::Season { count, .. } => format!("合集 {} 集", count),
             Entry::Series { count, .. } => format!("播放列表 {} 集", count),
             Entry::Up { mid, .. } => format!("mid {}", mid),
+            Entry::Dyn(d) => {
+                let mut s = format!(
+                    "{} · {}{} · 💬{}",
+                    d.time,
+                    if d.liked { "已赞♥" } else { "♥" },
+                    d.like,
+                    d.comment
+                );
+                if d.mid > 0 {
+                    s.push_str(&format!(" · uid {}", d.mid));
+                }
+                s
+            }
+            Entry::Comment(c) => {
+                let tag = if c.liked { "已赞" } else { "赞" };
+                let more = if c.replies.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · ↳{}", c.replies.len())
+                };
+                format!("{} · {}{} · {} · #{}{}", c.time, tag, c.like, c.floor, c.rpid, more)
+            }
         }
     }
 
@@ -329,6 +439,14 @@ impl Entry {
             Entry::Season { .. } => Color::Cyan,
             Entry::Series { .. } => Color::Green,
             Entry::Up { .. } => Color::LightBlue,
+            Entry::Dyn(d) => match d.kind.as_str() {
+                "视频" => Color::White,
+                "图文" => Color::Yellow,
+                "文章" => Color::LightBlue,
+                "直播" => Color::Magenta,
+                _ => Color::DarkGray,
+            },
+            Entry::Comment(c) => if c.liked { Color::LightRed } else { Color::Gray },
         }
     }
 }
@@ -353,6 +471,14 @@ pub struct View {
     /// 正在加载的页码（避免连按 > 重复请求同一页）
     pub pending_page: u32,
     pub has_more: bool,
+}
+
+/// 评论区目标：视频(aid) / 图片动态(相簿) / 文章 / 动态
+#[derive(Debug, Clone)]
+pub(crate) struct CommentCtx {
+    ctype: i32,
+    oid: String,
+    label: String,
 }
 
 pub struct App {
@@ -406,6 +532,16 @@ pub struct App {
     recover_at: Option<std::time::Instant>,
     /// 本次 Play 是卡顿恢复触发的，不要再重建弹幕线程
     recovering: bool,
+    /// 评论区当前目标与分页
+    cmt_ctx: Option<CommentCtx>,
+    cmt_root: Option<i64>,
+    cmt_parent: Option<i64>,
+    cmt_page: u32,
+    cmt_has_more: bool,
+    /// 待确认的评论：(正文, 目标描述)
+    cmt_pending: Option<(String, String)>,
+    /// 待确认的点赞：(目标描述, 目标)
+    like_pending: Option<(String, LikeTarget)>,
 }
 
 struct Report {
@@ -443,6 +579,7 @@ impl App {
                 View { name: "UP/合集", kind: ViewKind::Space, items: vec![], sel: 0, offset: 0, hint: ":up <mid|关键词> / :seasons <mid> / :season <BV号>".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
                 View { name: "动态", kind: ViewKind::Dynamic, items: vec![], sel: 0, offset: 0, hint: "关注 UP 的更新与直播（需登录）".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
                 View { name: "弹幕", kind: ViewKind::Danmaku, items: vec![], sel: 0, offset: 0, hint: "按 8 查看；:say <文本> 给当前视频/直播发弹幕；:rank 看高能榜".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
+                View { name: "评论", kind: ViewKind::Comment, items: vec![], sel: 0, offset: 0, hint: "9 打开当前视频评论；动态视图 Enter 看非视频动态评论；:cmt 发评论".into(), keyword: String::new(), stack: vec![], page: 1, source_id: 0, source_kind: 0, source_mid: 0, pending_page: 0, has_more: true },
             ],
             view_idx: 1,
             queue: VecDeque::new(),
@@ -481,6 +618,13 @@ impl App {
             stall_mark: None,
             recover_at: None,
             recovering: false,
+            cmt_ctx: None,
+            cmt_root: None,
+            cmt_parent: None,
+            cmt_page: 1,
+            cmt_has_more: false,
+            cmt_pending: None,
+            like_pending: None,
         };
         app.load_popular();
         app.load_fav();
@@ -816,20 +960,15 @@ impl App {
         }
     }
 
-    /// 确认后真正发送（限频：≥8 秒一条，每小时 ≤30 条）
-    fn commit_say(&mut self) {
-        let pending = self.say_pending.take();
-        let (text, label, target) = match pending {
-            Some(p) => p,
-            None => return,
-        };
+    /// 写操作统一限频：≥8 秒一条，每小时 ≤30 条
+    fn allow_write(&mut self) -> bool {
         if let Some(last) = self.last_say {
             if last.elapsed() < Duration::from_secs(8) {
                 self.status = format!(
-                    "发送太快：距上一条还差 {} 秒",
+                    "操作太快：距上一次还差 {} 秒",
                     8 - last.elapsed().as_secs()
                 );
-                return;
+                return false;
             }
         }
         let count = match self.say_window {
@@ -837,8 +976,8 @@ impl App {
             _ => 0,
         };
         if count >= 30 {
-            self.status = "已达到每小时 30 条上限，稍后再发".into();
-            return;
+            self.status = "已达到每小时 30 次上限，稍后再试".into();
+            return false;
         }
         self.last_say = Some(std::time::Instant::now());
         self.say_window = Some((
@@ -848,6 +987,18 @@ impl App {
                 .unwrap_or_else(std::time::Instant::now),
             count + 1,
         ));
+        true
+    }
+
+    /// 确认后真正发送弹幕
+    fn commit_say(&mut self) {
+        let (text, label, target) = match self.say_pending.take() {
+            Some(p) => p,
+            None => return,
+        };
+        if !self.allow_write() {
+            return;
+        }
         let _ = self.job_tx.send(Job::Say { text, target });
         self.status = format!("发送中 → {}", label);
     }
@@ -899,6 +1050,239 @@ impl App {
                 };
                 self.say_pending =
                     Some((arg.trim().to_string(), label, SayTarget::Video { cid, bvid, progress: pos }));
+            }
+        }
+    }
+
+    // ---------------- 评论 / 动态互动 ----------------
+
+    fn open_comments(&mut self, ctx: CommentCtx) {
+        self.view_idx = 8;
+        let v = &mut self.views[8];
+        v.items.clear();
+        v.sel = 0;
+        v.offset = 0;
+        v.page = 1;
+        v.hint = ctx.label.clone();
+        self.cmt_ctx = Some(ctx.clone());
+        self.cmt_root = None;
+        self.cmt_parent = None;
+        self.cmt_page = 1;
+        self.cmt_has_more = false;
+        self.status = format!("加载评论：{}", ctx.label);
+        let _ = self.job_tx.send(Job::Comments {
+            ctype: ctx.ctype,
+            oid: ctx.oid.clone(),
+            page: 1,
+            ctx,
+            root: None,
+        });
+    }
+
+    /// 当前播放项 / 选中项的评论区
+    fn open_current_comments(&mut self) {
+        let ctx = if let Some(t) = self.current.clone() {
+            if t.aid > 0 {
+                Some(CommentCtx {
+                    ctype: 1,
+                    oid: t.aid.to_string(),
+                    label: format!("视频 {}", fit(&t.title, 30)),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ctx = match ctx {
+            Some(c) => c,
+            None => match self.selected_entry() {
+                Some(Entry::Dyn(d)) => CommentCtx {
+                    ctype: d.ctype,
+                    oid: d.oid.clone(),
+                    label: format!("{} {}", d.kind, fit(&d.author, 20)),
+                },
+                Some(Entry::Track(t)) => {
+                    let aid = if t.aid > 0 {
+                        Some(t.aid)
+                    } else {
+                        t.bvid.as_ref().and_then(|b| self.api.video_aid(b).ok()).filter(|a| *a > 0)
+                    };
+                    match aid {
+                        Some(a) => CommentCtx {
+                            ctype: 1,
+                            oid: a.to_string(),
+                            label: format!("视频 {}", fit(&t.title, 30)),
+                        },
+                        None => {
+                            self.status = "该条目没有可用评论区".into();
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    self.status = "先播放/选中一个视频或动态，再按 9 看评论".into();
+                    return;
+                }
+            },
+        };
+        self.open_comments(ctx);
+    }
+
+    fn open_dyn_comments(&mut self, d: &DynItem) {
+        self.open_comments(CommentCtx {
+            ctype: d.ctype,
+            oid: d.oid.clone(),
+            label: format!("{} {} · {}", d.kind, d.author, fit(&d.text, 20)),
+        });
+    }
+
+    fn load_comments_page(&mut self) {
+        let ctx = match self.cmt_ctx.clone() {
+            Some(c) => c,
+            None => {
+                self.status = "先进入评论区".into();
+                return;
+            }
+        };
+        if self.cmt_root.is_some() {
+            self.status = "回复列表不支持翻页，Esc 返回主评论".into();
+            return;
+        }
+        if !self.cmt_has_more {
+            self.status = "评论没有下一页".into();
+            return;
+        }
+        self.cmt_page += 1;
+        let page = self.cmt_page;
+        self.status = format!("加载评论第 {} 页…", page);
+        let _ = self.job_tx.send(Job::Comments {
+            ctype: ctx.ctype,
+            oid: ctx.oid.clone(),
+            page,
+            ctx,
+            root: None,
+        });
+    }
+
+    fn load_comment_replies(&mut self, c: &Comment) {
+        let ctx = match self.cmt_ctx.clone() {
+            Some(c) => c,
+            None => {
+                self.status = "先进入评论区".into();
+                return;
+            }
+        };
+        self.cmt_root = Some(c.rpid);
+        self.cmt_parent = Some(c.rpid);
+        self.status = format!("加载回复 #{}…", c.rpid);
+        let _ = self.job_tx.send(Job::Comments {
+            ctype: ctx.ctype,
+            oid: ctx.oid.clone(),
+            page: 1,
+            ctx,
+            root: Some(c.rpid),
+        });
+    }
+
+    fn back_to_comment_root(&mut self) {
+        let ctx = match self.cmt_ctx.clone() {
+            Some(c) => c,
+            None => return,
+        };
+        self.cmt_root = None;
+        self.cmt_parent = None;
+        self.cmt_page = 1;
+        self.status = "返回主评论…".into();
+        let _ = self.job_tx.send(Job::Comments {
+            ctype: ctx.ctype,
+            oid: ctx.oid.clone(),
+            page: 1,
+            ctx,
+            root: None,
+        });
+    }
+
+    fn cmd_cmt(&mut self, arg: &str) {
+        if arg.trim().is_empty() {
+            self.status = "用法：:cmt <评论内容>（回复评论请在评论视图 Enter 进入回复后使用）".into();
+            return;
+        }
+        if !self.cfg.allow_send {
+            self.status = "写操作关闭：在 config.toml 把 allow_send 改为 true 后重启".into();
+            return;
+        }
+        if !self.cfg.logged_in() {
+            self.status = "需要登录（:login 扫码）".into();
+            return;
+        }
+        let ctx = match self.cmt_ctx.clone() {
+            Some(c) => c,
+            None => {
+                self.status = "先按 9 打开评论，或在动态视图 Enter 进入评论区".into();
+                return;
+            }
+        };
+        let label = match self.cmt_root {
+            Some(r) => format!("{} · 回复 #{}", ctx.label, r),
+            None => format!("{} · 一级评论", ctx.label),
+        };
+        self.cmt_pending = Some((arg.trim().to_string(), label));
+    }
+
+    fn commit_cmt(&mut self) {
+        let (text, label) = match self.cmt_pending.take() {
+            Some(p) => p,
+            None => return,
+        };
+        if !self.allow_write() {
+            return;
+        }
+        let ctx = match self.cmt_ctx.clone() {
+            Some(c) => c,
+            None => return,
+        };
+        let root = self.cmt_root.unwrap_or(0);
+        let parent = self.cmt_parent.unwrap_or(0);
+        let _ = self.job_tx.send(Job::CommentAdd {
+            text,
+            ctx,
+            root,
+            parent,
+            label: label.clone(),
+        });
+        self.status = format!("发表中 → {}", label);
+    }
+
+    fn commit_like(&mut self) {
+        let (label, target) = match self.like_pending.take() {
+            Some(p) => p,
+            None => return,
+        };
+        if !self.cfg.logged_in() {
+            self.status = "需要登录（:login 扫码）".into();
+            return;
+        }
+        if !self.allow_write() {
+            return;
+        }
+        match target {
+            LikeTarget::Video(aid) => match self.api.like(aid, true) {
+                Ok(()) => self.status = format!("已点赞视频 · {}", label),
+                Err(e) => self.status = format!("{}", e),
+            },
+            LikeTarget::Dyn(id) => {
+                let _ = self.job_tx.send(Job::DynLike { id, on: true, label: label.clone() });
+                self.status = format!("点赞中 → {}", label);
+            }
+            LikeTarget::Comment { rpid, ctx } => {
+                let _ = self.job_tx.send(Job::CommentLike {
+                    rpid,
+                    on: true,
+                    ctx,
+                    label: label.clone(),
+                });
+                self.status = format!("点赞中 → {}", label);
             }
         }
     }
@@ -993,6 +1377,10 @@ impl App {
             ViewKind::Danmaku => {
                 self.status = "弹幕视图：:say 发弹幕 / :rank 看高能榜 / Enter 跳到该时间点".into()
             }
+            ViewKind::Comment => match self.cmt_ctx.clone() {
+                Some(ctx) => self.open_comments(ctx),
+                None => self.open_current_comments(),
+            },
         }
     }
 
@@ -1107,6 +1495,21 @@ impl App {
                 }
             }
             Entry::Up { mid, name } => self.open_up_home(mid, &name),
+            Entry::Dyn(d) => {
+                if d.kind == "视频" {
+                    if let Some(bv) = &d.bvid {
+                        match self.api.resolve(bv) {
+                            Ok(t) => self.play_track(t),
+                            Err(e) => self.status = format!("{}", e),
+                        }
+                    } else {
+                        self.status = "该动态没有可播放的 BV 号".into();
+                    }
+                } else {
+                    self.open_dyn_comments(&d);
+                }
+            }
+            Entry::Comment(c) => self.load_comment_replies(&c),
         }
     }
 
@@ -1359,6 +1762,72 @@ impl App {
                     self.sync_queue_view();
                 }
                 JobOut::Note(m) => self.status = m,
+                JobOut::DmSent { text, at, label } => {
+                    self.dm.push(DmLine {
+                        at,
+                        user: "我".into(),
+                        text: text.clone(),
+                        color: 0xFF_FF_FF,
+                        mode: 1,
+                        kind: DmKind::Danmu,
+                    });
+                    if self.views[self.view_idx].kind == ViewKind::Danmaku && self.dm_follow {
+                        let n = self.dm_visible().len();
+                        self.dm_sel = n.saturating_sub(1);
+                    }
+                    self.status = format!("已发送 → {}｜{}", label, text);
+                }
+                JobOut::DynamicAll { items, err } => {
+                    let v = &mut self.views[6];
+                    v.pending_page = 0;
+                    if items.is_empty() && err.is_none() && v.page > 1 {
+                        v.has_more = false;
+                        self.status = format!("动态已到尾页（共 {} 条）", v.items.len());
+                    } else {
+                        if v.page == 1 {
+                            v.items.clear();
+                            v.sel = 0;
+                            v.offset = 0;
+                        }
+                        v.items.extend(items.into_iter().map(Entry::Dyn));
+                        v.has_more = !err.is_some();
+                        self.status = match err {
+                            Some(e) => format!("动态加载失败: {}", e),
+                            None => format!("动态 {} 条（含全部类型）", v.items.len()),
+                        };
+                    }
+                }
+                JobOut::Comments { items, has_more, ctx, root, err } => {
+                    let v = &mut self.views[8];
+                    if let Some(e) = err {
+                        self.status = format!("评论加载失败: {}", e);
+                    } else {
+                        self.cmt_ctx = Some(ctx.clone());
+                        self.cmt_root = root;
+                        self.cmt_has_more = has_more;
+                        if root.is_some() {
+                            v.items.clear();
+                            v.sel = 0;
+                            v.offset = 0;
+                        } else if self.cmt_page == 1 {
+                            v.items.clear();
+                            v.sel = 0;
+                            v.offset = 0;
+                        }
+                        let n = items.len();
+                        v.items.extend(items.into_iter().map(Entry::Comment));
+                        v.hint = if let Some(r) = root {
+                            format!("评论回复 · rpid {} · {}", r, ctx.label)
+                        } else {
+                            format!("{} · {} 条", ctx.label, n)
+                        };
+                        self.status = if root.is_some() {
+                            format!("回复 {} 条", n)
+                        } else {
+                            format!("评论 {} 条（> 下一页）", n)
+                        };
+                    }
+                }
                 JobOut::Rank { list, own } => {
                     let room = self
                         .current
@@ -1462,8 +1931,12 @@ impl App {
             return;
         }
         self.view_idx = 6;
-        self.status = "加载动态…".into();
-        let _ = self.job_tx.send(Job::Dynamic);
+        let v = &mut self.views[6];
+        v.page = 1;
+        v.has_more = true;
+        v.pending_page = 0;
+        self.status = "加载动态（全部类型）…".into();
+        let _ = self.job_tx.send(Job::DynamicAll { page: 1 });
     }
 
     /// 当前视图翻页（>, <）
@@ -1472,6 +1945,26 @@ impl App {
             let v = &self.views[self.view_idx];
             (v.kind, v.page + 1, v.keyword.clone(), v.source_id, v.source_kind, v.source_mid)
         };
+        if kind == ViewKind::Comment {
+            self.load_comments_page();
+            return;
+        }
+        if kind == ViewKind::Dynamic {
+            let v = &mut self.views[self.view_idx];
+            if !v.has_more {
+                self.status = "动态没有下一页了".into();
+                return;
+            }
+            if v.pending_page != 0 {
+                self.status = "上一页还在加载，稍等".into();
+                return;
+            }
+            v.pending_page = next;
+            v.page = next;
+            self.status = format!("加载动态第 {} 页…", next);
+            let _ = self.job_tx.send(Job::DynamicAll { page: next });
+            return;
+        }
         if matches!(kind, ViewKind::Popular | ViewKind::Queue | ViewKind::Danmaku) {
             self.status = "该视图不支持翻页".into();
             return;
@@ -1583,23 +2076,36 @@ impl App {
     }
 
     fn act_like(&mut self, _on: bool) {
-        let aid = match self.selected_aid() {
-            Some(a) => a,
-            None => {
-                self.status = "选中项没有 aid".into();
-                return;
-            }
+        if !self.cfg.logged_in() {
+            self.status = "需要登录（:login 扫码）".into();
+            return;
+        }
+        let kind = self.views[self.view_idx].kind;
+        let picked = match kind {
+            ViewKind::Comment => match self.selected_entry() {
+                Some(Entry::Comment(c)) => match self.cmt_ctx.clone() {
+                    Some(ctx) => Some((
+                        format!("评论 @{} · {}", c.user, fit(&c.text, 20)),
+                        LikeTarget::Comment { rpid: c.rpid, ctx },
+                    )),
+                    None => None,
+                },
+                _ => None,
+            },
+            ViewKind::Dynamic => match self.selected_entry() {
+                Some(Entry::Dyn(d)) => Some((
+                    format!("动态 @{} · {}", d.author, fit(&d.text, 20)),
+                    LikeTarget::Dyn(d.id.clone()),
+                )),
+                _ => None,
+            },
+            _ => self
+                .selected_aid()
+                .map(|a| (format!("视频 aid {}", a), LikeTarget::Video(a))),
         };
-        match self.api.like(aid, true) {
-            Ok(()) => self.status = "已发送点赞（重复点赞不影响）".into(),
-            Err(e) => {
-                let m = format!("{}", e);
-                if m.contains("65004") || m.contains("已经") {
-                    self.status = "已点过赞".into();
-                } else {
-                    self.status = m;
-                }
-            }
+        match picked {
+            Some(p) => self.like_pending = Some(p),
+            None => self.status = "当前选中项不支持点赞".into(),
         }
     }
 
@@ -1698,7 +2204,9 @@ impl App {
                 }
             }
             "season" => self.cmd_season(arg),
-            "dynamic" | "feed" => self.load_dynamic(),
+            "dynamic" | "feed" | "dyn" => self.load_dynamic(),
+            "comments" | "comment" if arg.is_empty() => self.open_current_comments(),
+            "cmt" | "comment" | "comments" => self.cmd_cmt(arg),
             "say" => self.cmd_say(arg),
             "rank" | "gold" => self.show_rank(),
             "like" => self.act_like(true),
@@ -1862,6 +2370,30 @@ impl App {
             return Ok(());
         }
 
+        if self.cmt_pending.is_some() {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.commit_cmt(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cmt_pending = None;
+                    self.status = "已取消发表".into();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.like_pending.is_some() {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.commit_like(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.like_pending = None;
+                    self.status = "已取消点赞".into();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.help {
             self.help = false;
             return Ok(());
@@ -1873,7 +2405,9 @@ impl App {
             }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
-                if !self.pop_browse() {
+                if self.views[self.view_idx].kind == ViewKind::Comment && self.cmt_root.is_some() {
+                    self.back_to_comment_root();
+                } else if !self.pop_browse() {
                     self.status = "已在顶层".into();
                 }
             }
@@ -1887,6 +2421,7 @@ impl App {
             }
             KeyCode::Char('6') => self.view_idx = 5,
             KeyCode::Char('7') => self.load_dynamic(),
+            KeyCode::Char('9') => self.open_current_comments(),
             KeyCode::Tab => self.view_idx = (self.view_idx + 1) % self.views.len(),
             KeyCode::BackTab => self.view_idx = (self.view_idx + self.views.len() - 1) % self.views.len(),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
@@ -1922,7 +2457,16 @@ impl App {
                 self.sync_queue_view();
                 self.status = "队列已清空".into();
             }
-            KeyCode::Char('c') => self.act_fav(true),
+            KeyCode::Char('c') => {
+                if self.views[self.view_idx].kind == ViewKind::Dynamic {
+                    match self.selected_entry() {
+                        Some(Entry::Dyn(d)) => self.open_dyn_comments(&d),
+                        _ => self.status = "选中一条动态后按 c 看评论".into(),
+                    }
+                } else {
+                    self.act_fav(true);
+                }
+            }
             KeyCode::Char('C') => self.act_fav(false),
             KeyCode::Char('v') => self.act_like(true),
             KeyCode::Char('w') => self.download_selected(),
@@ -2183,6 +2727,12 @@ impl App {
         if self.say_pending.is_some() {
             self.draw_say_dialog(f);
         }
+        if self.cmt_pending.is_some() {
+            self.draw_cmt_dialog(f);
+        }
+        if self.like_pending.is_some() {
+            self.draw_like_dialog(f);
+        }
         if self.help {
             self.draw_help(f, area);
         }
@@ -2406,11 +2956,7 @@ impl App {
         );
     }
 
-    fn draw_say_dialog(&self, f: &mut Frame) {
-        let (text, label, _) = match &self.say_pending {
-            Some(p) => p,
-            None => return,
-        };
+    fn draw_confirm_dialog(&self, f: &mut Frame, title: &str, text: &str, label: &str, verb: &str) {
         let area = f.size();
         let w = 72.min(area.width.saturating_sub(4));
         let h = 4;
@@ -2423,15 +2969,15 @@ impl App {
         f.render_widget(Clear, popup);
         let para = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("发送: ", Style::default().fg(Color::Yellow)),
-                Span::styled(text.clone(), Style::default().fg(Color::White)),
+                Span::styled("内容: ", Style::default().fg(Color::Yellow)),
+                Span::styled(text.to_string(), Style::default().fg(Color::White)),
             ]),
             Line::from(Span::styled(
                 format!("目标: {}", label),
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                "y / Enter 发送    n / Esc 取消",
+                format!("y / Enter {}    n / Esc 取消", verb),
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -2439,9 +2985,27 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
-                .title(Span::styled(" 确认发送弹幕 ", Style::default().fg(Color::Yellow))),
+                .title(Span::styled(title, Style::default().fg(Color::Yellow))),
         );
         f.render_widget(para, popup);
+    }
+
+    fn draw_say_dialog(&self, f: &mut Frame) {
+        if let Some((text, label, _)) = &self.say_pending {
+            self.draw_confirm_dialog(f, " 确认发送弹幕 ", text, label, "发送");
+        }
+    }
+
+    fn draw_cmt_dialog(&self, f: &mut Frame) {
+        if let Some((text, label)) = &self.cmt_pending {
+            self.draw_confirm_dialog(f, " 确认发表评论 ", text, label, "发表");
+        }
+    }
+
+    fn draw_like_dialog(&self, f: &mut Frame) {
+        if let Some((label, _)) = &self.like_pending {
+            self.draw_confirm_dialog(f, " 确认点赞 ", label, "点赞内容", "点赞");
+        }
     }
 
     fn draw_gauge(&self, f: &mut Frame, area: Rect) {

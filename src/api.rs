@@ -1,7 +1,7 @@
 //! bilibili Web API 封装：WBI 签名、搜索、热门、收藏、音轨解析、直播拉流。
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +55,41 @@ impl Track {
             Source::Live => format!("live{}", self.room_id.unwrap_or(0)),
         }
     }
+}
+
+/// 一条完整动态（含视频/图文/转发/文章/直播等非视频类型）
+#[derive(Debug, Clone)]
+pub struct DynItem {
+    pub id: String,
+    pub author: String,
+    pub mid: i64,
+    pub time: String,
+    pub text: String,
+    pub kind: String,
+    pub title: String,
+    pub bvid: Option<String>,
+    pub aid: i64,
+    pub images: usize,
+    pub like: i64,
+    pub comment: i64,
+    pub liked: bool,
+    /// 评论区类型：1 视频 / 11 图片 / 12 文章 / 17 动态
+    pub ctype: i32,
+    /// 评论区 oid：aid / 相簿 id / cv id / 动态 id
+    pub oid: String,
+}
+
+/// 一条评论（含最多一层回复预览）
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub rpid: i64,
+    pub user: String,
+    pub text: String,
+    pub like: i64,
+    pub liked: bool,
+    pub time: String,
+    pub floor: u64,
+    pub replies: Vec<Comment>,
 }
 
 impl std::fmt::Display for Track {
@@ -1045,8 +1080,10 @@ impl Api {
             ("plat".to_string(), "1".to_string()),
             ("csrf".to_string(), csrf),
             ("bvid".to_string(), bvid.to_string()),
-            ("web_location".to_string(), "333.1007".to_string()),
+            ("web_location".to_string(), "1315873".to_string()),
             ("rnd".to_string(), rnd),
+            // web 播放器在无用户指纹时的兜底参数，降低被风控拦截的概率
+            ("dm_img_switch".to_string(), "0".to_string()),
         ];
         let v = self.signed_post(
             "https://api.bilibili.com/x/v2/dm/post",
@@ -1059,11 +1096,16 @@ impl Api {
                 36701 => "弹幕包含被禁止的内容".to_string(),
                 36702 => "弹幕超过 100 字".to_string(),
                 36703 => "该视频禁止发送弹幕".to_string(),
+                36714 => "弹幕发送时间不合法".to_string(),
                 _ => v["message"].as_str().unwrap_or("").to_string(),
             };
             bail!("发送失败 {}: {}", code, msg);
         }
-        Ok("视频弹幕已发送".into())
+        let dmid = v["data"]["dmid_str"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_default();
+        Ok(format!("视频弹幕已发送 dmid={}", dmid))
     }
 
     /// 直播间高能榜（只读）：返回 (名字, 分数, 名次)，另附自己的名次
@@ -1111,6 +1153,40 @@ fn strip_html(s: &str) -> String {
         .replace("&#39;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn parse_comment(v: &Value) -> Comment {
+    let ctime = v["ctime"].as_u64().unwrap_or(0);
+    let ago = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(ctime);
+    let time = if ago < 60 {
+        "刚刚".into()
+    } else if ago < 3600 {
+        format!("{}分钟前", ago / 60)
+    } else if ago < 86400 {
+        format!("{}小时前", ago / 3600)
+    } else {
+        format!("{}天前", ago / 86400)
+    };
+    Comment {
+        rpid: v["rpid"].as_i64().unwrap_or(0),
+        user: strip_html(v["member"]["uname"].as_str().unwrap_or("")),
+        text: strip_html(v["content"]["message"].as_str().unwrap_or("")),
+        like: v["like"].as_i64().unwrap_or(0),
+        liked: v["action"].as_i64() == Some(1),
+        time,
+        floor: v["floor"].as_u64().unwrap_or(0),
+        replies: v["replies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(parse_comment)
+            .collect(),
+    }
 }
 
 fn parse_duration_str(s: &str) -> u64 {
@@ -1586,6 +1662,212 @@ impl Api {
                 })
             })
             .collect())
+    }
+
+    /// 关注动态的全部类型（视频 / 图文 / 转发 / 文章 / 直播等）
+    pub fn dynamic_items(&self, page: u32) -> Result<Vec<DynItem>> {
+        let url = format!(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=all&page={}&offset=",
+            page
+        );
+        let d = self.data(&url, REF_VIDEO)?;
+        Ok(d["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|it| {
+                let m = &it["modules"];
+                let author = &m["module_author"];
+                let dy = &m["module_dynamic"];
+                let major = &dy["major"];
+                let id = it["id_str"].as_str().unwrap_or("").to_string();
+                let mut item = DynItem {
+                    id,
+                    author: strip_html(author["name"].as_str().unwrap_or("")),
+                    mid: author["mid"].as_i64().unwrap_or(0),
+                    time: author["pub_time"].as_str().unwrap_or("").to_string(),
+                    text: strip_html(dy["desc"]["text"].as_str().unwrap_or("")),
+                    kind: "动态".into(),
+                    title: String::new(),
+                    bvid: None,
+                    aid: 0,
+                    images: 0,
+                    like: m["module_stat"]["like"]["count"].as_i64().unwrap_or(0),
+                    comment: m["module_stat"]["comment"]["count"].as_i64().unwrap_or(0),
+                    liked: m["module_stat"]["like"]["status"].as_bool().unwrap_or(false),
+                    ctype: 17,
+                    oid: it["id_str"].as_str().unwrap_or("").to_string(),
+                };
+                if major["archive"].is_object() {
+                    let a = &major["archive"];
+                    item.kind = "视频".into();
+                    item.title = strip_html(a["title"].as_str().unwrap_or(""));
+                    item.bvid = a["bvid"].as_str().map(str::to_string);
+                    item.aid = a["aid"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    if item.aid > 0 {
+                        item.ctype = 1;
+                        item.oid = item.aid.to_string();
+                    }
+                } else if major["draw"].is_object() {
+                    item.kind = "图文".into();
+                    item.images = major["draw"]["items"].as_array().map(|a| a.len()).unwrap_or(0);
+                    if let Some(aid) = major["draw"]["id"].as_str() {
+                        item.ctype = 11;
+                        item.oid = aid.to_string();
+                    }
+                    if item.text.is_empty() {
+                        item.title = format!("图片 x{}", item.images);
+                    }
+                } else if major["article"].is_object() {
+                    let a = &major["article"];
+                    item.kind = "文章".into();
+                    item.title = strip_html(a["title"].as_str().unwrap_or(""));
+                    if let Some(id) = a["id"].as_str() {
+                        item.ctype = 12;
+                        item.oid = id.to_string();
+                    }
+                } else if major["live_rcmd"].is_object() {
+                    item.kind = "直播".into();
+                    if let Ok(v) = serde_json::from_str::<Value>(major["live_rcmd"]["content"].as_str().unwrap_or("")) {
+                        item.title = strip_html(v["live_play_info"]["title"].as_str().unwrap_or(""));
+                    }
+                } else if major["orig"].is_object() {
+                    item.kind = "转发".into();
+                    if let Some(s) = major["orig"]["dynamic"].as_str() {
+                        if let Ok(v) = serde_json::from_str::<Value>(s) {
+                            item.title = strip_html(v["desc"]["text"].as_str().unwrap_or(""));
+                        }
+                    }
+                }
+                Some(item)
+            })
+            .collect())
+    }
+
+    /// 评论区列表；返回（评论, 是否还有下一页）
+    pub fn comments(&self, ctype: i32, oid: &str, page: u32) -> Result<(Vec<Comment>, bool)> {
+        let url = format!(
+            "https://api.bilibili.com/x/v2/reply?type={}&oid={}&pn={}&ps=20&sort=1",
+            ctype, oid, page
+        );
+        let data = self.data(&url, REF_VIDEO)?;
+        let mut out: Vec<Comment> = data["replies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(parse_comment)
+            .collect();
+        // 热评/置顶可能与 replies 重叠，按 rpid 去重
+        for key in ["hots", "top_replies"] {
+            if let Some(arr) = data[key].as_array() {
+                for v in arr {
+                    let c = parse_comment(v);
+                    if !out.iter().any(|x| x.rpid == c.rpid) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        let total = data["page"]["count"].as_u64().unwrap_or(0);
+        Ok((out, total > page as u64 * 20))
+    }
+
+    /// 某条评论的后续回复
+    pub fn comment_replies(&self, ctype: i32, oid: &str, root: i64, page: u32) -> Result<Vec<Comment>> {
+        let url = format!(
+            "https://api.bilibili.com/x/v2/reply/reply?type={}&oid={}&root={}&pn={}&ps=20",
+            ctype, oid, root, page
+        );
+        let d = self.data(&url, REF_VIDEO)?;
+        Ok(d["data"]["replies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(parse_comment)
+            .collect())
+    }
+
+    /// 发评论（root/parent 为 0 表示一级评论）
+    pub fn comment_add(&self, ctype: i32, oid: &str, text: &str, root: i64, parent: i64) -> Result<String> {
+        let csrf = self.csrf().ok_or_else(|| anyhow!("未登录（缺少 bili_jct）"))?;
+        let mut params = vec![
+            ("type".to_string(), ctype.to_string()),
+            ("oid".to_string(), oid.to_string()),
+            ("message".to_string(), text.to_string()),
+            ("plat".to_string(), "1".to_string()),
+            ("csrf".to_string(), csrf),
+        ];
+        if root > 0 {
+            params.push(("root".into(), root.to_string()));
+        }
+        if parent > 0 {
+            params.push(("parent".into(), parent.to_string()));
+        }
+        let v = self.form_post("https://api.bilibili.com/x/v2/reply/add", REF_VIDEO, &params)?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            bail!("评论发送失败 {}: {}", code, v["message"].as_str().unwrap_or(""));
+        }
+        Ok(v["data"]["success_toast"]
+            .as_str()
+            .unwrap_or("评论已发送")
+            .to_string())
+    }
+
+    /// 点赞/取消点赞评论
+    pub fn comment_like(&self, ctype: i32, oid: &str, rpid: i64, on: bool) -> Result<()> {
+        let csrf = self.csrf().ok_or_else(|| anyhow!("未登录（缺少 bili_jct）"))?;
+        let params = vec![
+            ("type".into(), ctype.to_string()),
+            ("oid".into(), oid.to_string()),
+            ("rpid".into(), rpid.to_string()),
+            ("action".into(), if on { "1" } else { "0" }.into()),
+            ("csrf".into(), csrf),
+        ];
+        let v = self.form_post("https://api.bilibili.com/x/v2/reply/action", REF_VIDEO, &params)?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            bail!("点赞评论失败 {}: {}", code, v["message"].as_str().unwrap_or(""));
+        }
+        Ok(())
+    }
+
+    /// 点赞/取消点赞动态
+    pub fn dynamic_like(&self, id: &str, on: bool) -> Result<()> {
+        let csrf = self.csrf().ok_or_else(|| anyhow!("未登录（缺少 bili_jct）"))?;
+        let url = format!(
+            "https://api.bilibili.com/x/dynamic/feed/dyn/thumb?csrf={}",
+            csrf
+        );
+        let body = json!({ "dyn_id_str": id, "up": if on { 1 } else { 2 } });
+        let v = self.json_post(&url, REF_VIDEO, body)?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            bail!("点赞动态失败 {}: {}", code, v["message"].as_str().unwrap_or(""));
+        }
+        Ok(())
+    }
+
+    /// JSON body 的写接口
+    fn json_post(&self, base: &str, referer: &str, body: Value) -> Result<Value> {
+        self.pace();
+        let mut r = self
+            .http
+            .post(base)
+            .header("Referer", referer)
+            .header("Origin", "https://www.bilibili.com")
+            .header("User-Agent", UA)
+            .json(&body);
+        let ck = self.cookie();
+        if !ck.is_empty() {
+            r = r.header("Cookie", ck);
+        }
+        let text = r.send()?.text().unwrap_or_default();
+        serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("接口返回非 JSON: {}", text.chars().take(80).collect::<String>()))
     }
 
     /// 关注动态里正在直播的 UP
