@@ -307,13 +307,18 @@ impl Mpv {
     }
 
     fn load(&self, url: &str, title: &str, referer: &str) {
+        // mpv 0.38+ 把 loadfile 的第 4 个参数改成了整数播放列表 index，
+        // 再传 options 对象会直接报 invalid parameter。
+        // 改为在 loadfile 前用全局属性设置，兼容新旧版本。
+        self.set_property("force-media-title", json!(title));
+        self.set_property(
+            "http-header-fields",
+            json!(format!("Referer: {},Cookie: {}", referer, self.cookie_hint())),
+        );
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().unwrap().insert(id, Prop::Load);
         let payload = json!({
-            "command": ["loadfile", url, "replace", {
-                "force-media-title": title,
-                "http-header-fields": format!("Referer: {}\r\nCookie: {}", referer, self.cookie_hint())
-            }],
+            "command": ["loadfile", url, "replace"],
             "request_id": id
         });
         let _ = self.tx.send(payload.to_string());

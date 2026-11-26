@@ -600,7 +600,12 @@ impl App {
         } else if snap.loaded && snap.error.is_none() {
             if self.play_at.take().is_some() {
                 let title = self.current.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-                self.status = format!("播放中 · {} · {}", title, self.stream_label);
+                let part = self.part_label();
+                self.status = if part.is_empty() {
+                    format!("播放中 · {} · {}", title, self.stream_label)
+                } else {
+                    format!("播放中 · {} · {} · {}", title, part, self.stream_label)
+                };
             }
         } else if let Some(at) = self.play_at {
             if self.current.is_some() && !snap.loaded && at.elapsed() > Duration::from_secs(5) {
@@ -651,7 +656,7 @@ impl App {
                 crate::danmaku::spawn_live(self.cfg.clone(), room, tx, stop.clone());
             }
             Source::Video => {
-                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                let cid = self.current_video_cid(t);
                 let aid = t.aid;
                 if cid <= 0 || aid <= 0 {
                     self.dm_note = format!("缺少 cid/aid，无法拉弹幕（cid={} aid={}）", cid, aid);
@@ -693,7 +698,7 @@ impl App {
             }
             Source::Video => {
                 let aid = t.aid;
-                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                let cid = self.current_video_cid(t);
                 if aid > 0 && cid > 0 {
                     self.report = Some(Report {
                         aid,
@@ -784,6 +789,33 @@ impl App {
         matches!(self.current.as_ref().map(|t| t.source), Some(Source::Live))
     }
 
+    /// 当前分P的 cid：按 cur_page 从 pages 里取，避免误用第一分P的 cid
+    fn current_video_cid(&self, t: &Track) -> i64 {
+        if let Some(pi) = self.cur_page {
+            if let Some(p) = t.pages.get(pi) {
+                if p.cid > 0 {
+                    return p.cid;
+                }
+            }
+        }
+        t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0)
+    }
+
+    /// 多分P视频的当前分P标签，例如「P2 后篇」
+    fn part_label(&self) -> String {
+        let t = match self.current.as_ref() {
+            Some(t) => t,
+            None => return String::new(),
+        };
+        if t.pages.len() <= 1 {
+            return String::new();
+        }
+        match self.cur_page.and_then(|i| t.pages.get(i)) {
+            Some(p) => format!("P{} {}", p.page, fit(&p.part, 24)),
+            None => String::new(),
+        }
+    }
+
     /// 确认后真正发送（限频：≥8 秒一条，每小时 ≤30 条）
     fn commit_say(&mut self) {
         let pending = self.say_pending.take();
@@ -852,14 +884,19 @@ impl App {
                 self.say_pending = Some((arg.trim().to_string(), label, SayTarget::Live { room }));
             }
             Source::Video => {
-                let cid = t.cid.or_else(|| t.pages.first().map(|p| p.cid)).unwrap_or(0);
+                let cid = self.current_video_cid(&t);
                 let bvid = t.bvid.clone().unwrap_or_default();
                 if cid <= 0 || bvid.is_empty() {
                     self.status = "当前视频缺少 cid/bvid".into();
                     return;
                 }
                 let pos = self.player.snapshot().pos.max(0.0) as u64;
-                let label = format!("{} @ {}", bvid, fmt_time(pos));
+                let part = self.part_label();
+                let label = if part.is_empty() {
+                    format!("{} @ {}", bvid, fmt_time(pos))
+                } else {
+                    format!("{} {} @ {}", bvid, part, fmt_time(pos))
+                };
                 self.say_pending =
                     Some((arg.trim().to_string(), label, SayTarget::Video { cid, bvid, progress: pos }));
             }
@@ -2424,9 +2461,11 @@ impl App {
         } else {
             "playing"
         };
+        let part = self.part_label();
         let label = format!(
-            "{}  {} / {}   vol {}{}{}",
+            "{}  {}{} / {}   vol {}{}{}",
             state,
+            if part.is_empty() { String::new() } else { format!("[{}] ", part) },
             fmt_time(snap.pos.max(0.0) as u64),
             if dur > 0.0 { fmt_time(dur as u64) } else { "--:--".into() },
             self.volume,

@@ -1025,6 +1025,14 @@ impl Api {
         let csrf = self
             .csrf()
             .ok_or_else(|| anyhow!("未登录（:login 扫码后才有 bili_jct）"))?;
+        // B 站接口的 progress 单位是毫秒；调用方传入的是秒。
+        // rnd 用微秒时间戳：缺省时服务端会把发送冷却拉长到 90 秒。
+        let progress_ms = progress.saturating_mul(1000).to_string();
+        let rnd = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .to_string();
         let params = vec![
             ("type".to_string(), "1".to_string()),
             ("oid".to_string(), cid.to_string()),
@@ -1033,11 +1041,12 @@ impl Api {
             ("fontsize".to_string(), "25".to_string()),
             ("pool".to_string(), "0".to_string()),
             ("mode".to_string(), "1".to_string()),
-            ("progress".to_string(), progress.to_string()),
+            ("progress".to_string(), progress_ms),
             ("plat".to_string(), "1".to_string()),
             ("csrf".to_string(), csrf),
             ("bvid".to_string(), bvid.to_string()),
             ("web_location".to_string(), "333.1007".to_string()),
+            ("rnd".to_string(), rnd),
         ];
         let v = self.signed_post(
             "https://api.bilibili.com/x/v2/dm/post",
