@@ -1883,6 +1883,19 @@ impl Api {
         Ok(())
     }
 
+    /// 拉取图片原始字节（动态缩略图用）
+    pub fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        self.pace();
+        let bytes = self
+            .http
+            .get(url)
+            .header("User-Agent", UA)
+            .header("Referer", REF_VIDEO)
+            .send()?
+            .bytes()?;
+        Ok(bytes.to_vec())
+    }
+
     /// JSON body 的写接口
     fn json_post(&self, base: &str, referer: &str, body: Value) -> Result<Value> {
         self.pace();

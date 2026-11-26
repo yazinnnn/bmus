@@ -1,6 +1,7 @@
 //! cmus 风格 TUI：视图 + 队列 + 浏览导航（收藏夹 / UP 主 / 合集 / 播放列表）
 
 use anyhow::Result;
+use image::GenericImageView;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -57,6 +58,14 @@ pub enum SayTarget {
     Live { room: i64 },
 }
 
+/// 已解码并缩放好的缩略图：rgb 每像素 3 字节，h 为偶数（两行像素合一格）
+#[derive(Clone)]
+pub(crate) struct Thumb {
+    w: u32,
+    h: u32,
+    rgb: Vec<u8>,
+}
+
 #[derive(Clone)]
 enum LikeTarget {
     Video(i64),
@@ -90,6 +99,8 @@ pub enum Job {
     CommentLike { rpid: i64, on: bool, ctx: CommentCtx, label: String },
     /// 点赞动态（确认后）
     DynLike { id: String, on: bool, label: String },
+    /// 拉取并解码动态图片缩略图
+    DynImages { key: String, urls: Vec<String> },
 }
 
 pub enum JobOut {
@@ -105,6 +116,7 @@ pub enum JobOut {
     DmSent { text: String, at: f64, label: String },
     DynamicAll { items: Vec<DynItem>, lives: Vec<Track>, next_offset: String, has_more: bool, err: Option<String> },
     Comments { items: Vec<Comment>, has_more: bool, ctx: CommentCtx, root: Option<i64>, err: Option<String> },
+    DynImages { key: String, thumb: Option<Thumb>, err: Option<String> },
     Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
 
@@ -329,6 +341,17 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                     Ok(()) => if on { format!("已点赞动态 · {}", label) } else { format!("已取消点赞 · {}", label) },
                     Err(e) => format!("{}", e),
                 }));
+            }
+            Job::DynImages { key, urls } => {
+                let out = match urls.first().map(|u| api.fetch_image(u)).transpose() {
+                    Ok(Some(bytes)) => match decode_thumb(&bytes) {
+                        Ok(thumb) => JobOut::DynImages { key, thumb: Some(thumb), err: None },
+                        Err(e) => JobOut::DynImages { key, thumb: None, err: Some(format!("{}", e)) },
+                    },
+                    Ok(None) => JobOut::DynImages { key, thumb: None, err: None },
+                    Err(e) => JobOut::DynImages { key, thumb: None, err: Some(format!("{}", e)) },
+                };
+                let _ = tx.send(out);
             }
         }
     }
@@ -557,6 +580,10 @@ pub struct App {
     dyn_live_count: usize,
     /// 评论页顶部展示的动态详情（从动态进入评论时）
     cmt_dyn: Option<DynItem>,
+    /// 是否渲染图片缩略图（i 键切换）
+    show_images: bool,
+    /// 当前动态的缩略图
+    cmt_thumb: Option<Thumb>,
 }
 
 struct Report {
@@ -574,6 +601,7 @@ impl App {
         let low = cfg.audio_quality == "lowest";
         let live_low = cfg.live_low;
         let volume = cfg.volume;
+        let image_preview = cfg.image_preview;
 
         let (job_tx, job_rx_jobs) = std::sync::mpsc::channel::<Job>();
         let (out_tx, job_rx) = std::sync::mpsc::channel::<JobOut>();
@@ -643,6 +671,8 @@ impl App {
             dyn_offset: String::new(),
             dyn_live_count: 0,
             cmt_dyn: None,
+            show_images: image_preview,
+            cmt_thumb: None,
         };
         app.load_popular();
         app.load_fav();
@@ -1088,6 +1118,7 @@ impl App {
         self.cmt_page = 1;
         self.cmt_has_more = false;
         self.cmt_dyn = None;
+        self.cmt_thumb = None;
         self.status = format!("加载评论：{}", ctx.label);
         let _ = self.job_tx.send(Job::Comments {
             ctype: ctx.ctype,
@@ -1155,6 +1186,13 @@ impl App {
             label: format!("{} {} · {}", d.kind, d.author, fit(&d.text, 20)),
         });
         self.cmt_dyn = Some(d.clone());
+        self.cmt_thumb = None;
+        if self.show_images && !d.image_urls.is_empty() {
+            let _ = self.job_tx.send(Job::DynImages {
+                key: d.id.clone(),
+                urls: d.image_urls.clone(),
+            });
+        }
     }
 
     fn load_comments_page(&mut self) {
@@ -1878,6 +1916,14 @@ impl App {
                         };
                     }
                 }
+                JobOut::DynImages { key, thumb, err } => {
+                    if self.cmt_dyn.as_ref().map(|d| d.id.as_str()) == Some(key.as_str()) {
+                        self.cmt_thumb = thumb;
+                        if let Some(e) = err {
+                            self.status = format!("图片预览失败: {}", e);
+                        }
+                    }
+                }
                 JobOut::Rank { list, own } => {
                     let room = self
                         .current
@@ -2480,6 +2526,17 @@ impl App {
             KeyCode::Char('6') => self.view_idx = 5,
             KeyCode::Char('7') => self.load_dynamic(),
             KeyCode::Char('9') => self.open_current_comments(),
+            KeyCode::Char('i') => {
+                self.show_images = !self.show_images;
+                self.status = if self.show_images {
+                    "图片预览：开（重新进入动态评论可加载）".into()
+                } else {
+                    "图片预览：关".into()
+                };
+                if !self.show_images {
+                    self.cmt_thumb = None;
+                }
+            }
             KeyCode::Tab => self.view_idx = (self.view_idx + 1) % self.views.len(),
             KeyCode::BackTab => self.view_idx = (self.view_idx + self.views.len() - 1) % self.views.len(),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
@@ -2874,7 +2931,7 @@ impl App {
         };
         let list_area = if let Some(d) = dyn_detail {
             let detail_w = cols[1].width.saturating_sub(4) as usize;
-            let dl = dyn_detail_lines(&d, detail_w);
+            let dl = dyn_detail_lines(&d, detail_w, self.cmt_thumb.as_ref());
             let h = (dl.len() + 2)
                 .min(cols[1].height.saturating_sub(6) as usize)
                 .max(3) as u16;
@@ -3267,8 +3324,50 @@ fn keep_playable(items: Vec<Entry>) -> Vec<Entry> {
         .collect()
 }
 
+/// 把图片字节解码并缩放到适合终端半块字符渲染的尺寸
+fn decode_thumb(bytes: &[u8]) -> Result<Thumb> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("图片解码失败: {}", e))?;
+    let (ow, oh) = img.dimensions();
+    if ow == 0 || oh == 0 {
+        anyhow::bail!("图片尺寸无效");
+    }
+    let scale = (48.0 / ow as f32).min(16.0 / oh as f32).min(1.0);
+    let w = ((ow as f32 * scale).round() as u32).max(2);
+    let mut h = ((oh as f32 * scale).round() as u32).max(2);
+    if h % 2 != 0 {
+        h += 1;
+    }
+    let rgb = img.to_rgb8();
+    let small = image::imageops::resize(&rgb, w, h, image::imageops::FilterType::Triangle);
+    Ok(Thumb { w, h, rgb: small.into_raw() })
+}
+
+/// 缩略图渲染成 ▀ 半块行：上半像素=前景色，下半像素=背景色
+fn thumb_lines(t: &Thumb, max_cols: usize) -> Vec<Line<'static>> {
+    let w = t.w.min(max_cols.max(1) as u32) as usize;
+    let mut out = Vec::new();
+    let mut y = 0;
+    while y + 1 < t.h as usize {
+        let mut spans = Vec::with_capacity(w);
+        for x in 0..w {
+            let i = (y * t.w as usize + x) * 3;
+            let j = ((y + 1) * t.w as usize + x) * 3;
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(t.rgb[i], t.rgb[i + 1], t.rgb[i + 2]))
+                    .bg(Color::Rgb(t.rgb[j], t.rgb[j + 1], t.rgb[j + 2])),
+            ));
+        }
+        out.push(Line::from(spans));
+        y += 2;
+    }
+    out
+}
+
 /// 动态详情块：正文 + 图片提示 + 统计
-fn dyn_detail_lines(d: &DynItem, width: usize) -> Vec<Line<'_>> {
+fn dyn_detail_lines(d: &DynItem, width: usize, thumb: Option<&Thumb>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let head = format!("[{}] {} · {}", d.kind, d.author, d.time);
     out.push(Line::from(Span::styled(
@@ -3292,15 +3391,18 @@ fn dyn_detail_lines(d: &DynItem, width: usize) -> Vec<Line<'_>> {
         }
     }
     if d.images > 0 {
-        let hint = if d.image_urls.is_empty() {
-            format!("🖼 图片 {} 张（接口未返回缩略图链接）", d.images)
-        } else {
-            format!("🖼 图片 {} 张 · {}", d.images, fit(&d.image_urls[0], width.saturating_sub(14)))
+        let hint = match thumb {
+            Some(_) => format!("🖼 图片 {} 张（已渲染第 1 张）", d.images),
+            None if d.image_urls.is_empty() => "🖼 图片（接口未返回缩略图链接）".into(),
+            None => format!("🖼 图片 {} 张 · {}", d.images, fit(&d.image_urls[0], width.saturating_sub(14))),
         };
         out.push(Line::from(Span::styled(
             fit(&hint, width),
             Style::default().fg(Color::DarkGray),
         )));
+        if let Some(t) = thumb {
+            out.extend(thumb_lines(t, width));
+        }
     }
     let stat = format!(
         "♥ {} · 💬 {} · uid {} · 动态 {}",

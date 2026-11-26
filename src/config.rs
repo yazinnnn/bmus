@@ -29,6 +29,8 @@ pub struct Config {
     pub max_bitrate: u32,
     /// 是否允许在 TUI 里给当前视频/直播发弹幕（:say）。默认关闭，涉及账号风控
     pub allow_send: bool,
+    /// 图文动态是否在终端用半块字符渲染缩略图（chafa 风格）
+    pub image_preview: bool,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
             ffmpeg_path: "ffmpeg".into(),
             max_bitrate: 192,
             allow_send: true,
+            image_preview: true,
         }
     }
 }
