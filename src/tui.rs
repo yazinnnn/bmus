@@ -2,6 +2,9 @@
 
 use anyhow::Result;
 use image::GenericImageView;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -56,6 +59,13 @@ impl Repeat {
 pub enum SayTarget {
     Video { cid: i64, bvid: String, progress: u64 },
     Live { room: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageMode {
+    Off,
+    Native,
+    Chars,
 }
 
 /// 已解码并缩放好的缩略图：rgb 每像素 3 字节，h 为偶数（两行像素合一格）
@@ -116,7 +126,7 @@ pub enum JobOut {
     DmSent { text: String, at: f64, label: String },
     DynamicAll { items: Vec<DynItem>, lives: Vec<Track>, next_offset: String, has_more: bool, err: Option<String> },
     Comments { items: Vec<Comment>, has_more: bool, ctx: CommentCtx, root: Option<i64>, err: Option<String> },
-    DynImages { key: String, thumb: Option<Thumb>, err: Option<String> },
+    DynImages { key: String, bytes: Option<Vec<u8>>, err: Option<String> },
     Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
 
@@ -344,12 +354,8 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
             }
             Job::DynImages { key, urls } => {
                 let out = match urls.first().map(|u| api.fetch_image(u)).transpose() {
-                    Ok(Some(bytes)) => match decode_thumb(&bytes) {
-                        Ok(thumb) => JobOut::DynImages { key, thumb: Some(thumb), err: None },
-                        Err(e) => JobOut::DynImages { key, thumb: None, err: Some(format!("{}", e)) },
-                    },
-                    Ok(None) => JobOut::DynImages { key, thumb: None, err: None },
-                    Err(e) => JobOut::DynImages { key, thumb: None, err: Some(format!("{}", e)) },
+                    Ok(bytes) => JobOut::DynImages { key, bytes, err: None },
+                    Err(e) => JobOut::DynImages { key, bytes: None, err: Some(format!("{}", e)) },
                 };
                 let _ = tx.send(out);
             }
@@ -580,9 +586,13 @@ pub struct App {
     dyn_live_count: usize,
     /// 评论页顶部展示的动态详情（从动态进入评论时）
     cmt_dyn: Option<DynItem>,
-    /// 是否渲染图片缩略图（i 键切换）
-    show_images: bool,
-    /// 当前动态的缩略图
+    /// 图片渲染模式（i 键循环：关/原生/字符）
+    image_mode: ImageMode,
+    /// 终端协议选择器
+    picker: Picker,
+    /// 原生协议的图片渲染状态
+    img_protocol: Option<Box<dyn StatefulProtocol>>,
+    /// 当前动态的缩略图（字符回退用）
     cmt_thumb: Option<Thumb>,
 }
 
@@ -671,7 +681,9 @@ impl App {
             dyn_offset: String::new(),
             dyn_live_count: 0,
             cmt_dyn: None,
-            show_images: image_preview,
+            image_mode: if image_preview { ImageMode::Native } else { ImageMode::Off },
+            picker: Picker::new((8, 16)),
+            img_protocol: None,
             cmt_thumb: None,
         };
         app.load_popular();
@@ -693,6 +705,7 @@ pub fn run(cfg: crate::config::Config) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    app.init_image_protocol();
 
     let result = app.event_loop(&mut terminal);
 
@@ -703,6 +716,22 @@ pub fn run(cfg: crate::config::Config) -> Result<()> {
 }
 
 impl App {
+    /// 探测终端图形协议；探测不到就留给字符回退路径
+    fn init_image_protocol(&mut self) {
+        if self.image_mode == ImageMode::Off {
+            return;
+        }
+        // tmux 会破坏/扭曲图形协议（Sixel 需特定版本，Kitty 需 passthrough），
+        // 与其套一层 tmux，不如在 tmux 内直接用字符回退。
+        if std::env::var("TMUX").is_ok() {
+            self.image_mode = ImageMode::Chars;
+            self.status = "检测到 tmux：图片使用字符四分块模式".into();
+            return;
+        }
+        let protocol = self.picker.guess_protocol();
+        self.status = format!("图片协议：{:?}", protocol);
+    }
+
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             if self.want_login {
@@ -1119,6 +1148,7 @@ impl App {
         self.cmt_has_more = false;
         self.cmt_dyn = None;
         self.cmt_thumb = None;
+        self.img_protocol = None;
         self.status = format!("加载评论：{}", ctx.label);
         let _ = self.job_tx.send(Job::Comments {
             ctype: ctx.ctype,
@@ -1187,7 +1217,7 @@ impl App {
         });
         self.cmt_dyn = Some(d.clone());
         self.cmt_thumb = None;
-        if self.show_images && !d.image_urls.is_empty() {
+        if self.image_mode != ImageMode::Off && !d.image_urls.is_empty() {
             let _ = self.job_tx.send(Job::DynImages {
                 key: d.id.clone(),
                 urls: d.image_urls.clone(),
@@ -1916,11 +1946,28 @@ impl App {
                         };
                     }
                 }
-                JobOut::DynImages { key, thumb, err } => {
-                    if self.cmt_dyn.as_ref().map(|d| d.id.as_str()) == Some(key.as_str()) {
-                        self.cmt_thumb = thumb;
+                JobOut::DynImages { key, bytes, err } => {
+                    let current = self.cmt_dyn.as_ref().map(|d| d.id.as_str()) == Some(key.as_str());
+                    if current {
+                        self.cmt_thumb = None;
+                        self.img_protocol = None;
                         if let Some(e) = err {
-                            self.status = format!("图片预览失败: {}", e);
+                            self.status = format!("图片拉取失败: {}", e);
+                        } else if let Some(bytes) = bytes {
+                            match image::load_from_memory(&bytes) {
+                                Ok(img) => {
+                                    if self.image_mode == ImageMode::Native
+                                        && self.picker.protocol_type != ProtocolType::Halfblocks
+                                    {
+                                        self.img_protocol = Some(self.picker.new_resize_protocol(img));
+                                        self.status = format!("图片：原生 {:?} 协议", self.picker.protocol_type);
+                                    } else if self.image_mode != ImageMode::Off {
+                                        self.cmt_thumb = Some(thumb_from_img(&img));
+                                        self.status = "图片：字符四分块渲染".into();
+                                    }
+                                }
+                                Err(e) => self.status = format!("图片解码失败: {}", e),
+                            }
                         }
                     }
                 }
@@ -2527,15 +2574,18 @@ impl App {
             KeyCode::Char('7') => self.load_dynamic(),
             KeyCode::Char('9') => self.open_current_comments(),
             KeyCode::Char('i') => {
-                self.show_images = !self.show_images;
-                self.status = if self.show_images {
-                    "图片预览：开（重新进入动态评论可加载）".into()
-                } else {
-                    "图片预览：关".into()
+                self.image_mode = match self.image_mode {
+                    ImageMode::Off => ImageMode::Native,
+                    ImageMode::Native => ImageMode::Chars,
+                    ImageMode::Chars => ImageMode::Off,
                 };
-                if !self.show_images {
-                    self.cmt_thumb = None;
-                }
+                self.img_protocol = None;
+                self.cmt_thumb = None;
+                self.status = match self.image_mode {
+                    ImageMode::Off => "图片预览：关".into(),
+                    ImageMode::Native => format!("图片预览：原生协议 {:?}（重新进入动态评论生效）", self.picker.protocol_type),
+                    ImageMode::Chars => "图片预览：字符四分块（重新进入动态评论生效）".into(),
+                };
             }
             KeyCode::Tab => self.view_idx = (self.view_idx + 1) % self.views.len(),
             KeyCode::BackTab => self.view_idx = (self.view_idx + self.views.len() - 1) % self.views.len(),
@@ -2923,7 +2973,7 @@ impl App {
             self.draw_danmaku(f, cols[1]);
             return;
         }
-        // 评论视图里，如果来源是某条动态，上方固定显示动态正文
+        // 评论视图里，如果来源是某条动态，上方固定显示动态正文 + 图片
         let dyn_detail = if self.views[self.view_idx].kind == ViewKind::Comment {
             self.cmt_dyn.clone()
         } else {
@@ -2931,14 +2981,13 @@ impl App {
         };
         let list_area = if let Some(d) = dyn_detail {
             let detail_w = cols[1].width.saturating_sub(4) as usize;
-            let dl = dyn_detail_lines(&d, detail_w, self.cmt_thumb.as_ref());
-            let h = (dl.len() + 2)
-                .min(cols[1].height.saturating_sub(6) as usize)
+            let native = self.img_protocol.is_some();
+            let thumb_rows = self.cmt_thumb.as_ref().map(|t| t.h as usize / 2).unwrap_or(0);
+            let has_image = native || thumb_rows > 0;
+            let dl = dyn_detail_lines(&d, detail_w, has_image);
+            let text_h = (dl.len() + 2)
+                .min(cols[1].height.saturating_sub(if has_image { 12 } else { 6 }) as usize)
                 .max(3) as u16;
-            let parts = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(h), Constraint::Min(4)])
-                .split(cols[1]);
             f.render_widget(
                 Paragraph::new(dl).block(
                     Block::default()
@@ -2946,9 +2995,44 @@ impl App {
                         .border_style(Style::default().fg(Color::DarkGray))
                         .title(Span::styled(" 动态正文 ", Style::default().fg(Color::Cyan))),
                 ),
-                parts[0],
+                Rect { height: text_h, ..cols[1] },
             );
-            parts[1]
+            if has_image {
+                let img_h = (if native { 10 } else { thumb_rows } + 2)
+                    .min(cols[1].height.saturating_sub(text_h + 5) as usize)
+                    .max(3) as u16;
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(text_h),
+                        Constraint::Length(img_h),
+                        Constraint::Min(4),
+                    ])
+                    .split(cols[1]);
+                let iblock = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray))
+                    .title(Span::styled(" 图片 ", Style::default().fg(Color::Cyan)));
+                let inner = iblock.inner(parts[1]);
+                f.render_widget(iblock, parts[1]);
+                if native {
+                    if let Some(proto) = self.img_protocol.as_mut() {
+                        f.render_stateful_widget(StatefulImage::new(None), inner, proto);
+                    }
+                } else if let Some(t) = &self.cmt_thumb {
+                    f.render_widget(
+                        Paragraph::new(thumb_lines(t, inner.width.saturating_sub(2) as usize)),
+                        inner,
+                    );
+                }
+                parts[2]
+            } else {
+                let parts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(text_h), Constraint::Min(4)])
+                    .split(cols[1]);
+                parts[1]
+            }
         } else {
             cols[1]
         };
@@ -3324,50 +3408,99 @@ fn keep_playable(items: Vec<Entry>) -> Vec<Entry> {
         .collect()
 }
 
-/// 把图片字节解码并缩放到适合终端半块字符渲染的尺寸
-fn decode_thumb(bytes: &[u8]) -> Result<Thumb> {
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| anyhow::anyhow!("图片解码失败: {}", e))?;
+/// 把已解码图片缩放成四分块渲染用的像素尺寸（每格 2x2 像素）
+fn thumb_from_img(img: &image::DynamicImage) -> Thumb {
     let (ow, oh) = img.dimensions();
-    if ow == 0 || oh == 0 {
-        anyhow::bail!("图片尺寸无效");
-    }
-    let scale = (48.0 / ow as f32).min(16.0 / oh as f32).min(1.0);
-    let w = ((ow as f32 * scale).round() as u32).max(2);
+    let scale = (160.0 / ow as f32).min(60.0 / oh as f32).min(1.0);
+    let mut w = ((ow as f32 * scale).round() as u32).max(2);
     let mut h = ((oh as f32 * scale).round() as u32).max(2);
-    if h % 2 != 0 {
-        h += 1;
-    }
+    if w % 2 != 0 { w += 1; }
+    if h % 2 != 0 { h += 1; }
     let rgb = img.to_rgb8();
     let small = image::imageops::resize(&rgb, w, h, image::imageops::FilterType::Triangle);
-    Ok(Thumb { w, h, rgb: small.into_raw() })
+    Thumb { w, h, rgb: small.into_raw() }
 }
 
-/// 缩略图渲染成 ▀ 半块行：上半像素=前景色，下半像素=背景色
+/// 四分块字符：bit0=左上 bit1=右上 bit2=左下 bit3=右下（前景色填充位）
+fn quad_char(mask: u8) -> char {
+    match mask {
+        0 => ' ', 1 => '▘', 2 => '▝', 3 => '▀', 4 => '▖', 5 => '▌', 6 => '▞', 7 => '▛',
+        8 => '▗', 9 => '▚', 10 => '▐', 11 => '▜', 12 => '▄', 13 => '▙', 14 => '▟', _ => '█',
+    }
+}
+
+fn rgb_avg(sum: [i64; 3], n: i64) -> [i32; 3] {
+    if n == 0 {
+        return [0, 0, 0];
+    }
+    [
+        (sum[0] / n).clamp(0, 255) as i32,
+        (sum[1] / n).clamp(0, 255) as i32,
+        (sum[2] / n).clamp(0, 255) as i32,
+    ]
+}
+
+fn rgb_color(c: [i32; 3]) -> Color {
+    Color::Rgb(c[0] as u8, c[1] as u8, c[2] as u8)
+}
+
+/// 为一个 2x2 像素块挑最优的两色 + 字符（穷举 16 种填充组合）
+fn pick_quad(q: [[i32; 3]; 4]) -> (char, Color, Color) {
+    let mut best = (i64::MAX, ' ', Color::Reset, Color::Reset);
+    for mask in 0u8..16 {
+        let (mut fs, mut bs) = ([0i64; 3], [0i64; 3]);
+        let (mut fnn, mut bnn) = (0i64, 0i64);
+        for (i, c) in q.iter().enumerate() {
+            if mask & (1u8 << i) != 0 {
+                for k in 0..3 { fs[k] += c[k] as i64; }
+                fnn += 1;
+            } else {
+                for k in 0..3 { bs[k] += c[k] as i64; }
+                bnn += 1;
+            }
+        }
+        let fg = rgb_avg(fs, fnn);
+        let bg = rgb_avg(bs, bnn);
+        let mut err = 0i64;
+        for (i, c) in q.iter().enumerate() {
+            let t = if mask & (1u8 << i) != 0 { fg } else { bg };
+            for k in 0..3 {
+                let d = c[k] as i64 - t[k] as i64;
+                err += d * d;
+            }
+        }
+        if err < best.0 {
+            best = (err, quad_char(mask), rgb_color(fg), rgb_color(bg));
+        }
+    }
+    (best.1, best.2, best.3)
+}
+
+/// 缩略图渲染：每格 2x2 像素，前景/背景两色自适应
 fn thumb_lines(t: &Thumb, max_cols: usize) -> Vec<Line<'static>> {
-    let w = t.w.min(max_cols.max(1) as u32) as usize;
-    let mut out = Vec::new();
-    let mut y = 0;
-    while y + 1 < t.h as usize {
-        let mut spans = Vec::with_capacity(w);
-        for x in 0..w {
-            let i = (y * t.w as usize + x) * 3;
-            let j = ((y + 1) * t.w as usize + x) * 3;
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(Color::Rgb(t.rgb[i], t.rgb[i + 1], t.rgb[i + 2]))
-                    .bg(Color::Rgb(t.rgb[j], t.rgb[j + 1], t.rgb[j + 2])),
-            ));
+    let half_cols = t.w as usize / 2;
+    let cols = half_cols.min(max_cols.max(1));
+    let rows = t.h as usize / 2;
+    let mut out = Vec::with_capacity(rows);
+    for cy in 0..rows {
+        let mut spans = Vec::with_capacity(cols);
+        for cx in 0..cols {
+            let sx = if cols < half_cols { (cx * half_cols / cols) * 2 } else { cx * 2 };
+            let sy = cy * 2;
+            let px = |dx: usize, dy: usize| -> [i32; 3] {
+                let i = ((sy + dy) * t.w as usize + sx + dx) * 3;
+                [t.rgb[i] as i32, t.rgb[i + 1] as i32, t.rgb[i + 2] as i32]
+            };
+            let (ch, fg, bg) = pick_quad([px(0, 0), px(1, 0), px(0, 1), px(1, 1)]);
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(fg).bg(bg)));
         }
         out.push(Line::from(spans));
-        y += 2;
     }
     out
 }
 
 /// 动态详情块：正文 + 图片提示 + 统计
-fn dyn_detail_lines(d: &DynItem, width: usize, thumb: Option<&Thumb>) -> Vec<Line<'static>> {
+fn dyn_detail_lines(d: &DynItem, width: usize, has_image: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let head = format!("[{}] {} · {}", d.kind, d.author, d.time);
     out.push(Line::from(Span::styled(
@@ -3391,18 +3524,17 @@ fn dyn_detail_lines(d: &DynItem, width: usize, thumb: Option<&Thumb>) -> Vec<Lin
         }
     }
     if d.images > 0 {
-        let hint = match thumb {
-            Some(_) => format!("🖼 图片 {} 张（已渲染第 1 张）", d.images),
-            None if d.image_urls.is_empty() => "🖼 图片（接口未返回缩略图链接）".into(),
-            None => format!("🖼 图片 {} 张 · {}", d.images, fit(&d.image_urls[0], width.saturating_sub(14))),
+        let hint = if has_image {
+            format!("🖼 图片 {} 张（已渲染第 1 张）", d.images)
+        } else if d.image_urls.is_empty() {
+            "🖼 图片（接口未返回缩略图链接）".into()
+        } else {
+            format!("🖼 图片 {} 张 · {}", d.images, fit(&d.image_urls[0], width.saturating_sub(14)))
         };
         out.push(Line::from(Span::styled(
             fit(&hint, width),
             Style::default().fg(Color::DarkGray),
         )));
-        if let Some(t) = thumb {
-            out.extend(thumb_lines(t, width));
-        }
     }
     let stat = format!(
         "♥ {} · 💬 {} · uid {} · 动态 {}",
@@ -3456,3 +3588,4 @@ fn fit(s: &str, width: usize) -> String {
     out.push_str(&" ".repeat(pad));
     out
 }
+
