@@ -19,9 +19,10 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::VecDeque;
 use std::io::Stdout;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
 
 use crate::api::{fmt_time, Api, Comment, DynItem, Source, Track};
@@ -111,6 +112,8 @@ pub enum Job {
     DynLike { id: String, on: bool, label: String },
     /// 拉取并解码动态图片缩略图
     DynImages { key: String, urls: Vec<String> },
+    /// 把当前动态的图片保存到缓存并用系统看图工具打开
+    OpenImages { urls: Vec<String> },
 }
 
 pub enum JobOut {
@@ -362,6 +365,13 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                     }
                 }
                 let _ = tx.send(JobOut::DynImages { key, images, err });
+            }
+            Job::OpenImages { urls } => {
+                let out = match open_images_external(&api, &urls) {
+                    Ok(s) => s,
+                    Err(e) => format!("打开图片失败: {}", e),
+                };
+                let _ = tx.send(JobOut::Note(out));
             }
         }
     }
@@ -2599,6 +2609,21 @@ impl App {
             KeyCode::Char('6') => self.view_idx = 5,
             KeyCode::Char('7') => self.load_dynamic(),
             KeyCode::Char('9') => self.open_current_comments(),
+            KeyCode::Char('o') => {
+                if self.views[self.view_idx].kind == ViewKind::Comment {
+                    let urls = self
+                        .cmt_dyn
+                        .as_ref()
+                        .map(|d| d.image_urls.clone())
+                        .unwrap_or_default();
+                    if urls.is_empty() {
+                        self.status = "当前动态没有图片".into();
+                    } else {
+                        self.status = format!("正在用系统看图工具打开 {} 张图片…", urls.len().min(4));
+                        let _ = self.job_tx.send(Job::OpenImages { urls });
+                    }
+                }
+            }
             KeyCode::Char('i') => {
                 self.image_mode = match self.image_mode {
                     ImageMode::Off => ImageMode::Native,
@@ -3474,6 +3499,76 @@ fn keep_playable(items: Vec<Entry>) -> Vec<Entry> {
         .collect()
 }
 
+/// 把动态图片下载到缓存目录，然后交给系统默认看图工具（不占用终端渲染）
+fn open_images_external(api: &Api, urls: &[String]) -> Result<String> {
+    if urls.is_empty() {
+        anyhow::bail!("该动态没有图片");
+    }
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("bmus")
+        .join("images");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut files = Vec::new();
+    for (i, url) in urls.iter().take(4).enumerate() {
+        let bytes = api.fetch_image(url)?;
+        let lower = url.to_ascii_lowercase();
+        let ext = if lower.contains(".png") {
+            "png"
+        } else if lower.contains(".webp") {
+            "webp"
+        } else {
+            "jpg"
+        };
+        let path = dir.join(format!("{}-{}.{}", stamp, i + 1, ext));
+        std::fs::write(&path, &bytes)?;
+        files.push(path);
+    }
+    let mut cmd = if let Ok(viewer) = std::env::var("BMUS_IMAGE_VIEWER") {
+        let mut parts = viewer.split_whitespace();
+        let mut c = Command::new(parts.next().unwrap_or("xdg-open"));
+        for p in parts {
+            c.arg(p);
+        }
+        c
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        Command::new("explorer")
+    } else {
+        Command::new("xdg-open")
+    };
+    for f in &files {
+        cmd.arg(f);
+    }
+    match cmd.spawn() {
+        Ok(_) => Ok(format!(
+            "已用系统看图工具打开 {} 张图片（缓存：{}）",
+            files.len(),
+            dir.display()
+        )),
+        Err(e) => {
+            // xdg-open 缺失时再试 gio open（GNOME/KDE 常见）
+            let mut fallback = Command::new("gio");
+            fallback.arg("open");
+            for f in &files {
+                fallback.arg(f);
+            }
+            match fallback.spawn() {
+                Ok(_) => Ok(format!("已用 gio 打开 {} 张图片", files.len())),
+                Err(_) => Err(anyhow::anyhow!(
+                    "启动看图工具失败: {}；可设置 BMUS_IMAGE_VIEWER 指定程序",
+                    e
+                )),
+            }
+        }
+    }
+}
+
 /// 把已解码图片缩放成四分块渲染用的像素尺寸（每格 2x2 像素）
 fn thumb_from_img(img: &image::DynamicImage) -> Thumb {
     let (ow, oh) = img.dimensions();
@@ -3655,4 +3750,5 @@ fn fit(s: &str, width: usize) -> String {
     out.push_str(&" ".repeat(pad));
     out
 }
+
 

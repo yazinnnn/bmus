@@ -184,7 +184,7 @@ bmus dynlives [--raw]                             # 关注 UP 的直播列表 / 
 bmus livetest <room> --secs 15                    # 逐档实测直播音频码率
 ```
 
-环境变量：`BMUS_BACKEND=lib|proc`、`BMUS_LIBMPV=/path/libmpv.so`、`BMUS_MPV_AO=null`（无声调试）、`BMUS_SESSDATA`。
+环境变量：`BMUS_BACKEND=lib|proc`、`BMUS_LIBMPV=/path/libmpv.so`、`BMUS_MPV_AO=null`（无声调试）、`BMUS_SESSDATA`、`BMUS_IMAGE_VIEWER`（覆盖系统默认看图工具，如 `okular`）。
 
 ## TUI 快捷键
 
@@ -212,6 +212,7 @@ bmus livetest <room> --secs 15                    # 逐档实测直播音频码�
 | `8` / `t` | 直接打开弹幕视图（默认自动跟屏） | — |
 | `f` / 点右下角按钮（鼠标可点） | 开关「自动跟屏」：关掉后 `j/k` 翻历史不会跳回最新 | — |
 | `Enter`（弹幕视图） | 跳到该条弹幕的时间点（视频） | — |
+| `o`（评论视图） | 把当前动态的图片下载到缓存并用系统看图工具打开 | — |
 | `i` | 图片模式循环：关 → 原生协议 → 字符四分块 | — |
 | `7` / `:dyn` | 动态视图，显示全类型（视频/图文/转发/文章/直播） | — |
 | `Enter`（动态视图） | 视频动态→播放；其他动态→打开该动态评论 | — |
