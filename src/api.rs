@@ -1687,7 +1687,14 @@ impl Api {
                 let dy = &m["module_dynamic"];
                 let major = &dy["major"];
                 let id = it["id_str"].as_str().unwrap_or("").to_string();
-                let text = strip_html(dy["desc"]["text"].as_str().unwrap_or(""));
+                let mut text = strip_html(dy["desc"]["text"].as_str().unwrap_or(""));
+                if text.is_empty() {
+                    // 部分图文动态正文在富文本节点里，desc.text 为空
+                    let nodes = dy["desc"]["rich_text_nodes"].as_array().cloned().unwrap_or_default();
+                    text = strip_html(
+                        &nodes.iter().filter_map(|n| n["text"].as_str()).collect::<Vec<_>>().join(""),
+                    );
+                }
                 // basic 里直接给了评论区的 type/oid，比按卡片类型猜更可靠
                 let btype = it["basic"]["comment_type"].as_i64().unwrap_or(0) as i32;
                 let boid = it["basic"]["comment_id_str"].as_str().unwrap_or("").to_string();
@@ -1775,6 +1782,42 @@ impl Api {
         let next = d["offset"].as_str().unwrap_or("").to_string();
         let has_more = d["has_more"].as_bool().unwrap_or(false) && !next.is_empty();
         Ok((items, next, has_more))
+    }
+
+    /// 动态详情接口兜底：取正文与全部图片链接（web 新版接口）
+    pub fn dynamic_detail_text(&self, id: &str) -> Result<(String, Vec<String>)> {
+        let url = format!(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={}",
+            id
+        );
+        let d = self.data(&url, REF_VIDEO)?;
+        let item = &d["item"];
+        let dy = &item["modules"]["module_dynamic"];
+        let mut text = strip_html(dy["desc"]["text"].as_str().unwrap_or(""));
+        if text.is_empty() {
+            let nodes = dy["desc"]["rich_text_nodes"].as_array().cloned().unwrap_or_default();
+            text = strip_html(
+                &nodes.iter().filter_map(|n| n["text"].as_str()).collect::<Vec<_>>().join(""),
+            );
+        }
+        let major = &dy["major"];
+        if text.is_empty() {
+            text = strip_html(
+                major["opus"]["summary"]
+                    .as_str()
+                    .or_else(|| major["opus"]["desc"].as_str())
+                    .or_else(|| major["article"]["desc"].as_str())
+                    .unwrap_or(""),
+            );
+        }
+        let urls: Vec<String> = major["draw"]["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| p["src"].as_str().map(str::to_string))
+            .collect();
+        Ok((text, urls))
     }
 
     /// 评论区列表；返回（评论, 是否还有下一页）

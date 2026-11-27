@@ -126,7 +126,7 @@ pub enum JobOut {
     DmSent { text: String, at: f64, label: String },
     DynamicAll { items: Vec<DynItem>, lives: Vec<Track>, next_offset: String, has_more: bool, err: Option<String> },
     Comments { items: Vec<Comment>, has_more: bool, ctx: CommentCtx, root: Option<i64>, err: Option<String> },
-    DynImages { key: String, bytes: Option<Vec<u8>>, err: Option<String> },
+    DynImages { key: String, images: Vec<Vec<u8>>, err: Option<String> },
     Rank { list: Vec<(String, i64, i64)>, own: Option<(String, i64, i64)> },
 }
 
@@ -353,11 +353,15 @@ fn worker(cfg: crate::config::Config, rx: std::sync::mpsc::Receiver<Job>, tx: st
                 }));
             }
             Job::DynImages { key, urls } => {
-                let out = match urls.first().map(|u| api.fetch_image(u)).transpose() {
-                    Ok(bytes) => JobOut::DynImages { key, bytes, err: None },
-                    Err(e) => JobOut::DynImages { key, bytes: None, err: Some(format!("{}", e)) },
-                };
-                let _ = tx.send(out);
+                let mut images = Vec::new();
+                let mut err = None;
+                for url in urls.iter().take(4) {
+                    match api.fetch_image(url) {
+                        Ok(bytes) => images.push(bytes),
+                        Err(e) => { err = Some(format!("{}", e)); break; }
+                    }
+                }
+                let _ = tx.send(JobOut::DynImages { key, images, err });
             }
         }
     }
@@ -590,10 +594,10 @@ pub struct App {
     image_mode: ImageMode,
     /// 终端协议选择器
     picker: Picker,
-    /// 原生协议的图片渲染状态
-    img_protocol: Option<Box<dyn StatefulProtocol>>,
-    /// 当前动态的缩略图（字符回退用）
-    cmt_thumb: Option<Thumb>,
+    /// 原生协议的图片渲染状态（多图）
+    img_protocols: Vec<Box<dyn StatefulProtocol>>,
+    /// 当前动态的缩略图（字符回退用，多图）
+    cmt_thumbs: Vec<Thumb>,
 }
 
 struct Report {
@@ -683,8 +687,8 @@ impl App {
             cmt_dyn: None,
             image_mode: if image_preview { ImageMode::Native } else { ImageMode::Off },
             picker: Picker::new((8, 16)),
-            img_protocol: None,
-            cmt_thumb: None,
+            img_protocols: Vec::new(),
+            cmt_thumbs: Vec::new(),
         };
         app.load_popular();
         app.load_fav();
@@ -1147,8 +1151,8 @@ impl App {
         self.cmt_page = 1;
         self.cmt_has_more = false;
         self.cmt_dyn = None;
-        self.cmt_thumb = None;
-        self.img_protocol = None;
+        self.cmt_thumbs.clear();
+        self.img_protocols.clear();
         self.status = format!("加载评论：{}", ctx.label);
         let _ = self.job_tx.send(Job::Comments {
             ctype: ctx.ctype,
@@ -1210,17 +1214,31 @@ impl App {
     }
 
     fn open_dyn_comments(&mut self, d: &DynItem) {
+        // feed 卡片有时不给正文/图片，用详情接口补齐
+        let mut item = d.clone();
+        if item.body.trim().is_empty() || item.image_urls.is_empty() {
+            if let Ok((text, urls)) = self.api.dynamic_detail_text(&item.id) {
+                if item.body.trim().is_empty() && !text.is_empty() {
+                    item.body = text.clone();
+                    if item.text.is_empty() {
+                        item.text = fit(&text, 40);
+                    }
+                }
+                if item.image_urls.is_empty() {
+                    item.image_urls = urls;
+                }
+            }
+        }
         self.open_comments(CommentCtx {
-            ctype: d.ctype,
-            oid: d.oid.clone(),
-            label: format!("{} {} · {}", d.kind, d.author, fit(&d.text, 20)),
+            ctype: item.ctype,
+            oid: item.oid.clone(),
+            label: format!("{} {} · {}", item.kind, item.author, fit(&item.text, 20)),
         });
-        self.cmt_dyn = Some(d.clone());
-        self.cmt_thumb = None;
-        if self.image_mode != ImageMode::Off && !d.image_urls.is_empty() {
+        self.cmt_dyn = Some(item.clone());
+        if self.image_mode != ImageMode::Off && !item.image_urls.is_empty() {
             let _ = self.job_tx.send(Job::DynImages {
-                key: d.id.clone(),
-                urls: d.image_urls.clone(),
+                key: item.id.clone(),
+                urls: item.image_urls.clone(),
             });
         }
     }
@@ -1946,28 +1964,36 @@ impl App {
                         };
                     }
                 }
-                JobOut::DynImages { key, bytes, err } => {
+                JobOut::DynImages { key, images, err } => {
                     let current = self.cmt_dyn.as_ref().map(|d| d.id.as_str()) == Some(key.as_str());
                     if current {
-                        self.cmt_thumb = None;
-                        self.img_protocol = None;
-                        if let Some(e) = err {
-                            self.status = format!("图片拉取失败: {}", e);
-                        } else if let Some(bytes) = bytes {
+                        self.cmt_thumbs.clear();
+                        self.img_protocols.clear();
+                        let mut loaded = 0;
+                        for bytes in images {
                             match image::load_from_memory(&bytes) {
                                 Ok(img) => {
                                     if self.image_mode == ImageMode::Native
                                         && self.picker.protocol_type != ProtocolType::Halfblocks
                                     {
-                                        self.img_protocol = Some(self.picker.new_resize_protocol(img));
-                                        self.status = format!("图片：原生 {:?} 协议", self.picker.protocol_type);
+                                        self.img_protocols.push(self.picker.new_resize_protocol(img));
                                     } else if self.image_mode != ImageMode::Off {
-                                        self.cmt_thumb = Some(thumb_from_img(&img));
-                                        self.status = "图片：字符四分块渲染".into();
+                                        self.cmt_thumbs.push(thumb_from_img(&img));
                                     }
+                                    loaded += 1;
                                 }
                                 Err(e) => self.status = format!("图片解码失败: {}", e),
                             }
+                        }
+                        if loaded > 0 {
+                            self.status = if !self.img_protocols.is_empty() {
+                                format!("图片：{} 张 · 原生 {:?} 协议", loaded, self.picker.protocol_type)
+                            } else {
+                                format!("图片：{} 张 · 字符四分块渲染", loaded)
+                            };
+                        }
+                        if let Some(e) = err {
+                            self.status = format!("图片拉取失败: {}（已加载 {} 张）", e, loaded);
                         }
                     }
                 }
@@ -2579,8 +2605,8 @@ impl App {
                     ImageMode::Native => ImageMode::Chars,
                     ImageMode::Chars => ImageMode::Off,
                 };
-                self.img_protocol = None;
-                self.cmt_thumb = None;
+                self.img_protocols.clear();
+                self.cmt_thumbs.clear();
                 self.status = match self.image_mode {
                     ImageMode::Off => "图片预览：关".into(),
                     ImageMode::Native => format!("图片预览：原生协议 {:?}（重新进入动态评论生效）", self.picker.protocol_type),
@@ -2981,12 +3007,13 @@ impl App {
         };
         let list_area = if let Some(d) = dyn_detail {
             let detail_w = cols[1].width.saturating_sub(4) as usize;
-            let native = self.img_protocol.is_some();
-            let thumb_rows = self.cmt_thumb.as_ref().map(|t| t.h as usize / 2).unwrap_or(0);
-            let has_image = native || thumb_rows > 0;
+            let native = !self.img_protocols.is_empty();
+            let thumb_rows = self.cmt_thumbs.iter().map(|t| t.h as usize / 2).sum::<usize>();
+            let count = if native { self.img_protocols.len() } else { self.cmt_thumbs.len() };
+            let has_image = count > 0;
             let dl = dyn_detail_lines(&d, detail_w, has_image);
             let text_h = (dl.len() + 2)
-                .min(cols[1].height.saturating_sub(if has_image { 12 } else { 6 }) as usize)
+                .min(if has_image { 12 } else { cols[1].height.saturating_sub(6) as usize })
                 .max(3) as u16;
             f.render_widget(
                 Paragraph::new(dl).block(
@@ -2998,9 +3025,12 @@ impl App {
                 Rect { height: text_h, ..cols[1] },
             );
             if has_image {
-                let img_h = (if native { 10 } else { thumb_rows } + 2)
-                    .min(cols[1].height.saturating_sub(text_h + 5) as usize)
-                    .max(3) as u16;
+                let img_limit = if native { 24usize } else { thumb_rows }.min(u16::MAX as usize);
+                let img_h = cols[1]
+                    .height
+                    .saturating_sub(text_h + 5)
+                    .min(img_limit as u16)
+                    .max(4);
                 let parts = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -3012,18 +3042,48 @@ impl App {
                 let iblock = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray))
-                    .title(Span::styled(" 图片 ", Style::default().fg(Color::Cyan)));
+                    .title(Span::styled(format!(" 图片 {} 张 ", count), Style::default().fg(Color::Cyan)));
                 let inner = iblock.inner(parts[1]);
                 f.render_widget(iblock, parts[1]);
-                if native {
-                    if let Some(proto) = self.img_protocol.as_mut() {
-                        f.render_stateful_widget(StatefulImage::new(None), inner, proto);
+                let grid_n = if count > 1 { 2 } else { 1 };
+                let grid_w = inner.width / grid_n as u16;
+                let mut cells = Vec::new();
+                for c in 0..grid_n {
+                    let r = Rect {
+                        x: inner.x + grid_w * c as u16,
+                        width: if c + 1 == grid_n { inner.width - grid_w * c as u16 } else { grid_w },
+                        ..inner
+                    };
+                    cells.push(r);
+                }
+                for i in 0..count {
+                    let col = i % grid_n;
+                    let rows_n = (count + grid_n - 1) / grid_n;
+                    let row_i = i / grid_n;
+                    let cell_h = cells[col].height / rows_n as u16;
+                    let area = Rect {
+                        y: cells[col].y + cell_h * row_i as u16,
+                        height: if row_i + 1 == rows_n {
+                            cells[col].height - cell_h * row_i as u16
+                        } else {
+                            cell_h
+                        },
+                        ..cells[col]
+                    };
+                    if native {
+                        if let Some(proto) = self.img_protocols.get_mut(i) {
+                            f.render_stateful_widget(StatefulImage::new(None), area, proto);
+                        }
+                    } else if let Some(t) = self.cmt_thumbs.get(i) {
+                        f.render_widget(
+                            Paragraph::new(thumb_lines(
+                                t,
+                                area.width.saturating_sub(2) as usize,
+                                area.height.saturating_sub(2) as usize,
+                            )),
+                            area,
+                        );
                     }
-                } else if let Some(t) = &self.cmt_thumb {
-                    f.render_widget(
-                        Paragraph::new(thumb_lines(t, inner.width.saturating_sub(2) as usize)),
-                        inner,
-                    );
                 }
                 parts[2]
             } else {
@@ -3306,7 +3366,13 @@ impl App {
     }
 
     fn draw_hints(&mut self, f: &mut Frame, area: Rect) {
-        let hint = " Enter 播放  a 入队  space 暂停  n 下一首  [/] 分P  8 弹幕  :say 发弹幕  > 翻页  c 收藏  v 点赞  w 下载  / 搜索  : 命令  ? 帮助  q 退出";
+        let img_tag = match self.image_mode {
+            ImageMode::Off => "",
+            ImageMode::Native if self.picker.protocol_type != ProtocolType::Halfblocks => "[图:原生] ",
+            ImageMode::Native => "[图:字符] ",
+            ImageMode::Chars => "[图:字符] ",
+        };
+        let hint = format!("{}{}", img_tag, "Enter 播放  a 入队  space 暂停  n 下一首  [/] 分P  8 弹幕  :say 发弹幕  > 翻页  c 收藏  v 点赞  w 下载  / 搜索  : 命令  ? 帮助  q 退出");
         let danmaku = self.views[self.view_idx].kind == ViewKind::Danmaku;
         let label = if self.dm_follow { " 自动跟屏:开 " } else { " 自动跟屏:关 " };
         let label_w = if danmaku {
@@ -3314,7 +3380,7 @@ impl App {
         } else {
             0
         };
-        let text = fit(hint, area.width.saturating_sub(label_w) as usize);
+        let text = fit(&hint, area.width.saturating_sub(label_w) as usize);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))),
             area,
@@ -3411,13 +3477,13 @@ fn keep_playable(items: Vec<Entry>) -> Vec<Entry> {
 /// 把已解码图片缩放成四分块渲染用的像素尺寸（每格 2x2 像素）
 fn thumb_from_img(img: &image::DynamicImage) -> Thumb {
     let (ow, oh) = img.dimensions();
-    let scale = (160.0 / ow as f32).min(60.0 / oh as f32).min(1.0);
+    let scale = (400.0 / ow as f32).min(120.0 / oh as f32).min(1.0);
     let mut w = ((ow as f32 * scale).round() as u32).max(2);
     let mut h = ((oh as f32 * scale).round() as u32).max(2);
     if w % 2 != 0 { w += 1; }
     if h % 2 != 0 { h += 1; }
     let rgb = img.to_rgb8();
-    let small = image::imageops::resize(&rgb, w, h, image::imageops::FilterType::Triangle);
+    let small = image::imageops::resize(&rgb, w, h, image::imageops::FilterType::Lanczos3);
     Thumb { w, h, rgb: small.into_raw() }
 }
 
@@ -3477,16 +3543,17 @@ fn pick_quad(q: [[i32; 3]; 4]) -> (char, Color, Color) {
 }
 
 /// 缩略图渲染：每格 2x2 像素，前景/背景两色自适应
-fn thumb_lines(t: &Thumb, max_cols: usize) -> Vec<Line<'static>> {
+fn thumb_lines(t: &Thumb, max_cols: usize, max_rows: usize) -> Vec<Line<'static>> {
     let half_cols = t.w as usize / 2;
+    let half_rows = t.h as usize / 2;
     let cols = half_cols.min(max_cols.max(1));
-    let rows = t.h as usize / 2;
+    let rows = half_rows.min(max_rows.max(1));
     let mut out = Vec::with_capacity(rows);
     for cy in 0..rows {
         let mut spans = Vec::with_capacity(cols);
         for cx in 0..cols {
             let sx = if cols < half_cols { (cx * half_cols / cols) * 2 } else { cx * 2 };
-            let sy = cy * 2;
+            let sy = if rows < half_rows { (cy * half_rows / rows) * 2 } else { cy * 2 };
             let px = |dx: usize, dy: usize| -> [i32; 3] {
                 let i = ((sy + dy) * t.w as usize + sx + dx) * 3;
                 [t.rgb[i] as i32, t.rgb[i + 1] as i32, t.rgb[i + 2] as i32]
