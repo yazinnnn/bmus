@@ -584,6 +584,8 @@ pub struct App {
     recover_at: Option<std::time::Instant>,
     /// 本次 Play 是卡顿恢复触发的，不要再重建弹幕线程
     recovering: bool,
+    /// 离开图形视图后需要强制清屏，避免 Sixel/Kitty 残留
+    need_clear: bool,
     /// 评论区当前目标与分页
     cmt_ctx: Option<CommentCtx>,
     cmt_root: Option<i64>,
@@ -685,6 +687,7 @@ impl App {
             stall_mark: None,
             recover_at: None,
             recovering: false,
+            need_clear: false,
             cmt_ctx: None,
             cmt_root: None,
             cmt_parent: None,
@@ -751,6 +754,10 @@ impl App {
             if self.want_login {
                 self.want_login = false;
                 self.do_login(terminal)?;
+            }
+            if self.need_clear {
+                self.need_clear = false;
+                terminal.clear()?;
             }
             terminal.draw(|f| self.draw(f))?;
             self.player.tick();
@@ -1163,6 +1170,7 @@ impl App {
         self.cmt_dyn = None;
         self.cmt_thumbs.clear();
         self.img_protocols.clear();
+        self.need_clear = true;
         self.status = format!("加载评论：{}", ctx.label);
         let _ = self.job_tx.send(Job::Comments {
             ctype: ctx.ctype,
@@ -1802,6 +1810,7 @@ impl App {
     }
 
     fn poll_jobs(&mut self) {
+        let old_view = self.view_idx;
         while let Ok(out) = self.job_rx.try_recv() {
             match out {
                 JobOut::Fatal(m) => self.status = m,
@@ -1979,6 +1988,7 @@ impl App {
                     if current {
                         self.cmt_thumbs.clear();
                         self.img_protocols.clear();
+                        self.need_clear = true;
                         let mut loaded = 0;
                         for bytes in images {
                             match image::load_from_memory(&bytes) {
@@ -2042,6 +2052,9 @@ impl App {
                     }
                 }
             }
+        }
+        if self.view_idx != old_view && !self.img_protocols.is_empty() {
+            self.need_clear = true;
         }
     }
 
@@ -2507,6 +2520,7 @@ impl App {
     // ---------------- 按键 ----------------
 
     fn on_key(&mut self, k: KeyEvent) -> Result<()> {
+        let old_view = self.view_idx;
         if let Some((_, buf)) = self.input.clone() {
             match k.code {
                 KeyCode::Esc => {
@@ -2632,6 +2646,7 @@ impl App {
                 };
                 self.img_protocols.clear();
                 self.cmt_thumbs.clear();
+                self.need_clear = true;
                 self.status = match self.image_mode {
                     ImageMode::Off => "图片预览：关".into(),
                     ImageMode::Native => format!("图片预览：原生协议 {:?}（重新进入动态评论生效）", self.picker.protocol_type),
@@ -2791,6 +2806,9 @@ impl App {
                 };
             }
             _ => {}
+        }
+        if self.view_idx != old_view && !self.img_protocols.is_empty() {
+            self.need_clear = true;
         }
         Ok(())
     }
